@@ -49,10 +49,57 @@ def init_modules(cfg, device, data: Data, start_time, resume_cfg: ResumeConfig, 
     stats = logging_utils.TrainingStats.init_from_snapshot(snapshot, start_time=start_time, resume_whole_state=resume_cfg.whole_state, allow_missing_state=resume_cfg.allow_missing_stats)
     vis = (EasyDict.init_recursively(snapshot['vis']) if (resume_cfg.whole_state and snapshot is not None and 'vis' in snapshot) else logging_utils.load_vis_data(cfg, loss_fn, data.dataset)) if load_vis else None
 
+    # Stage 2 / A2: create the EMA target teacher AFTER the student has been initialized/loaded, so
+    # that at step 0 teacher == student bitwise (which makes A2 identical to A1 at initialization).
+    if str(getattr(cfg.loss, 'target_branch', 'shared')) == 'ema':
+        assert getattr(loss_fn, 'teacher', None) is None, \
+            'loss_fn.teacher is already set (the EMA target teacher must be the only teacher for alphaflow).'
+        teacher = init_ema_teacher_from_student(cfg, nets.net, device)
+        if snapshot is not None and snapshot.get('teacher') is not None:
+            teacher.load_state_dict(snapshot['teacher'])
+            dist.loginfo0('Loaded the EMA target teacher state from the snapshot.')
+        else:
+            dist.logwarn0('The snapshot has no `teacher` state; initialized the EMA target teacher '
+                          'from the current student (only valid when starting a fresh run).')
+        loss_fn.teacher = teacher
+        dist.loginfo0(f'EMA target teacher created: '
+                      f'{sum(p.numel() for p in teacher.parameters()):,} parameters '
+                      f'(not optimized; EMA-updated after each optimizer step).')
+
     del snapshot; misc.free_memory() # Delete resume data from memory
     dist.loginfo0('Done!')
 
     return nets, optimizers, loss_fn, vis, stats
+
+
+def init_ema_teacher_from_student(cfg, net: torch.nn.Module, device) -> torch.nn.Module:
+    """Creates the frozen EMA target teacher as a copy of the current student.
+
+    The teacher is a separate module (NOT the evaluation EMA `nets.ema`): it is used only by the
+    loss target branch, it is never optimized and never used for generation/evaluation.
+    Buffers and parameters are copied verbatim; dtype/device follow the student.
+    """
+    student = misc.unwrap_module(net)
+    teacher = copy.deepcopy(student)
+    teacher = teacher.to(device=device)
+    teacher.eval().requires_grad_(False)
+    return teacher
+
+
+@torch.no_grad()
+def teacher_student_distance_(teacher: torch.nn.Module, student: torch.nn.Module) -> float:
+    """Relative L2 distance between the teacher and student parameters (diagnostic only)."""
+    teacher_params = dict(misc.unwrap_module(teacher).named_parameters())
+    num = 0.0
+    den = 0.0
+    for name, student_param in misc.unwrap_module(student).named_parameters():
+        teacher_param = teacher_params.get(name)
+        if teacher_param is None or not student_param.dtype.is_floating_point:
+            continue
+        diff = (teacher_param.detach().float() - student_param.detach().float())
+        num += float((diff * diff).sum())
+        den += float((student_param.detach().float() ** 2).sum())
+    return (num / max(den, 1e-12)) ** 0.5
 
 
 def init_state_head_from_velocity_(net: torch.nn.Module) -> int:
@@ -321,7 +368,7 @@ def load_module_state(cfg, module: torch.nn.Module, snapshot, name: str, resume_
                           f'(the checkpoint has no state head).')
 
 
-def save_snapshot(cfg, nets: Nets, optimizers: Optimizers, data: Data, stats: logging_utils.TrainingStats, vis, snapshot_path, reason: str='', save_non_empty_optim: bool=True) -> str:
+def save_snapshot(cfg, nets: Nets, optimizers: Optimizers, data: Data, stats: logging_utils.TrainingStats, vis, snapshot_path, reason: str='', save_non_empty_optim: bool=True, loss_fn=None) -> str:
     assert isinstance(stats, logging_utils.TrainingStats), f'Expected stats to be of type TrainingStats, but got {type(stats)}'
     # Save network snapshot.
     dist.loginfo0(f'Saving the snapshot (reason: {reason})... ', end='')
@@ -355,6 +402,9 @@ def save_snapshot(cfg, nets: Nets, optimizers: Optimizers, data: Data, stats: lo
         # Main module's state.
         'net': misc.unwrap_module(nets.net).state_dict(),
         'ema': misc.unwrap_module(nets.ema).state_dict() if nets.ema is not None else None,
+        # Stage 2 / A2: the EMA target teacher (separate from the evaluation EMA above). None for A0/A1.
+        'teacher': (misc.unwrap_module(loss_fn.teacher).state_dict()
+                    if (loss_fn is not None and getattr(loss_fn, 'teacher', None) is not None) else None),
         'lr_scheduler': None if optimizers.lr_scheduler is None else optimizers.lr_scheduler.state_dict(),
         'grad_scaler': None if optimizers.grad_scaler is None else optimizers.grad_scaler.state_dict(),
         'optimizer': optim_state_dict, # We'll fill the optimizer later.

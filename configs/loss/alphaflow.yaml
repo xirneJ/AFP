@@ -7,6 +7,16 @@ target: src.training.loss.AlphaFlowLoss
 
 adaptive_loss_weight_eps: 0.001
 
+# Source of the consistency-target network evaluations (stage 2 / A2).
+#   shared -> official implementation: targets are computed with the same (stop-gradient) student
+#             network that is being optimized. This is the default and keeps A0/A1 behaviour identical.
+#   ema    -> targets are computed with a separate EMA "teacher" copy of the student.
+#             The teacher is created in network_utils.init_modules, EMA-updated after each optimizer
+#             step (same schedule/frequency as the evaluation EMA), and never optimized.
+#             Only the *target* network changes; the loss formula, weighting, alpha schedule, CFG,
+#             clipping and sampling are untouched.
+target_branch: shared
+
 time_sampling_fm: # Distribution when t_next == t
   timestep_distrib_type: logit_norm
   scale: 1.0

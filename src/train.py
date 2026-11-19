@@ -68,6 +68,7 @@ def train(cfg: DictConfig):
     nets, optimizers, loss_fn, vis, stats = network_utils.init_modules(cfg=cfg, device=device, start_time=_start_time, data=data, resume_cfg=resume_cfg)
     nets_to_log = nets if cfg.wandb.log_ema_stats else Nets(net=nets.net, ema=None)
     net_named_parameters = ema_named_parameters = None # dict cache for the model.
+    teacher_named_parameters = teacher_ema_named_parameters = None # dict cache for the EMA target teacher (A2 only).
 
     # Note: we need to print the model info before computing the stats since it inits FSDP.
     logging_utils.print_model_info(cfg, data.batch_info.batch_gpu, nets, device)
@@ -92,7 +93,7 @@ def train(cfg: DictConfig):
 
     if cfg.training.save_init and stats.cur_step == 0:
         snapshot_path = network_utils.get_snapshot_path(cfg, stats, snapshot_suffix='init')
-        network_utils.save_snapshot(cfg, nets, optimizers, data, stats, vis, snapshot_path, reason='init', save_non_empty_optim=True)
+        network_utils.save_snapshot(cfg, nets, optimizers, data, stats, vis, snapshot_path, reason='init', save_non_empty_optim=True, loss_fn=loss_fn)
 
     dist.loginfo0('Entering the main training loop...')
 
@@ -199,6 +200,14 @@ def train(cfg: DictConfig):
         # Maybe update the EMA.
         ema_beta, net_named_parameters, ema_named_parameters = update_ema(cfg, nets.net, nets.ema, stats, net_named_parameters, ema_named_parameters) if should_update_ema and cfg.model.use_ema else (1.0, None, None)
 
+        # Maybe update the EMA target teacher (stage 2 / A2). This is a *separate* module from the
+        # evaluation EMA above: it is only used by the loss target branch. Update order is identical
+        # to the evaluation EMA: after optimizer.step() + grad clip, every `ema_update_freq` optimizer
+        # steps, with the same decay/rampup formula (t = stats.cur_step = optimizer step count).
+        if should_update_ema and getattr(loss_fn, 'teacher', None) is not None:
+            _, teacher_named_parameters, teacher_ema_named_parameters = update_ema(
+                cfg, nets.net, loss_fn.teacher, stats, teacher_named_parameters, teacher_ema_named_parameters)
+
         with torch.profiler.record_function('stats_log_and_update'):
             # Let's save some stats
             if cfg.wandb.enabled:
@@ -238,6 +247,9 @@ def train(cfg: DictConfig):
             extra_stats = {f'loss_{loss_key}': float(loss_value.mean()) for loss_key, loss_value in loss_means.items()}
             for stats_dict in (net_grad_log_dict, grad_norm_log_dict):
                 extra_stats.update({k.replace('Grad/', 'grad_'): float(v) for k, v in stats_dict.items()})
+            if getattr(loss_fn, 'teacher', None) is not None:
+                # Diagnostic: is the EMA target teacher actually moving away from the student?
+                extra_stats['teacher_student_rel_dist'] = network_utils.teacher_student_distance_(loss_fn.teacher, nets.net)
             logging_utils.print_tick_stats0(stats, tick_stats, loss_means['total'].mean(), device, maintenance_time, extra_stats=extra_stats)
             if cfg.wandb.enabled:
                 sec_per_nimg = (tick_stats.end_time - tick_stats.start_time) / (stats.cur_nimg - tick_stats.start_nimg + 1e-16)
@@ -257,7 +269,7 @@ def train(cfg: DictConfig):
             dist.print0()
             dist.loginfo0('Training is done! Aborting... ')
 
-        evaluate_and_snapshot(cfg, stats, nets, optimizers, data, vis, device, should_ctrl_snapshot=ctrl_state.should_snapshot)
+        evaluate_and_snapshot(cfg, stats, nets, optimizers, data, vis, device, should_ctrl_snapshot=ctrl_state.should_snapshot, loss_fn=loss_fn)
 
         if not should_continue_tick:
             # Update state for the new tick.
@@ -522,7 +534,7 @@ def compute_gradients(cfg, net_dp, data: Data, stats, loss_fn, grad_scaler, devi
 
 #----------------------------------------------------------------------------
 
-def evaluate_and_snapshot(cfg, stats, nets: Nets, optimizers: Optimizers, data: Data, vis, device, should_ctrl_snapshot: bool=False):
+def evaluate_and_snapshot(cfg, stats, nets: Nets, optimizers: Optimizers, data: Data, vis, device, should_ctrl_snapshot: bool=False, loss_fn=None):
     # TODO: move from `metrics_rare` to just specifying metric log frequency.
     snapshot_path = network_utils.get_snapshot_path(cfg, stats)
     curr_metrics = cfg.training.metrics if not cfg.training.freqs.metrics is None and (stats.done or stats.cur_step % cfg.training.freqs.metrics == 0 or stats.cur_step == 1) else []
@@ -534,7 +546,7 @@ def evaluate_and_snapshot(cfg, stats, nets: Nets, optimizers: Optimizers, data: 
     if reason_to_snapshot is not None:
         try:
             stats.snapshot_descs[snapshot_path] = reason_to_snapshot
-            network_utils.save_snapshot(cfg, nets, optimizers, data, stats, vis, snapshot_path, reason=reason_to_snapshot)
+            network_utils.save_snapshot(cfg, nets, optimizers, data, stats, vis, snapshot_path, reason=reason_to_snapshot, loss_fn=loss_fn)
             if dist.is_main_process() and reason_to_snapshot == 'step_latest':
                 # Delete the previous latest snapshot (if any)
                 snapshots_to_delete = [p for p, reason in stats.snapshot_descs.items() if reason == 'step_latest' and p != snapshot_path]

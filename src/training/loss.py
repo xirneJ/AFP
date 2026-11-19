@@ -558,8 +558,21 @@ class AlphaFlowLoss(RecFlowLoss):
         x_t = self.apply_noise(x_aug, noise_scaled, t, net) # [b, t, c, h, w]
         velocity = noise_unscaled - x_aug # [b, t, c, h, w]
 
-        # Apply cfg training
-        velocity_cfg = self._compute_velocity_cfg(velocity=velocity, x_t=x_t, t=t, cond=cond, augment_labels=augment_labels, net=net, batch_size=batch_size) # [b, t, c, h, w]
+        # Source of the target network evaluations (stage 2 / A2):
+        #   shared -> the student itself (official implementation; stop-gradient via the @no_grad helpers);
+        #   ema    -> a separate EMA teacher created in network_utils.init_modules.
+        # Only the target computations below use `target_net`; the student forward pass is unchanged.
+        target_branch = str(self.cfg.get('target_branch', 'shared'))
+        assert target_branch in ('shared', 'ema'), f'Unknown target_branch: {target_branch}'
+        if target_branch == 'ema':
+            assert getattr(self, 'teacher', None) is not None, \
+                'target_branch=ema requires loss_fn.teacher to be set (created in network_utils.init_modules).'
+            target_net = self.teacher
+        else:
+            target_net = net
+
+        # Apply cfg training (target construction)
+        velocity_cfg = self._compute_velocity_cfg(velocity=velocity, x_t=x_t, t=t, cond=cond, augment_labels=augment_labels, net=target_net, batch_size=batch_size) # [b, t, c, h, w]
 
         # Split batch for continuous (alpha == 1 or r == t) and discrete training (0 < alpha <= 1)
         mask_c = (dt == 0).flatten() # [b]
@@ -568,11 +581,14 @@ class AlphaFlowLoss(RecFlowLoss):
         velocity_cfg_c, x_t_c, t_c, t_next_c, cond_c, = velocity_cfg[mask_c], x_t[mask_c], t[mask_c], t_next[mask_c], cond[mask_c]
         x_t_d, velocity_cfg_d, t_d, t_next_d, dt_d, cond_d, = x_t[mask_d], velocity_cfg[mask_d], t[mask_d], t_next[mask_d], dt[mask_d], cond[mask_d]
 
-        # Calculate u_tgt when alpha == 1 or r == t
-        mean_velocity_c = self._compute_mean_velocity_c(x_t_c, t_next_c, t_c, velocity_cfg_c, cond_c, augment_labels, net) # [b_c, t, c, h, w]
+        # Calculate u_tgt when alpha == 1 or r == t (target network: student or EMA teacher)
+        mean_velocity_c = self._compute_mean_velocity_c(x_t_c, t_next_c, t_c, velocity_cfg_c, cond_c, augment_labels, target_net) # [b_c, t, c, h, w]
 
-        # Calculate u_tgt when 0 < alpha <= 1
-        mean_velocity_d = self._compute_mean_velocity_d(x_t_d, velocity_cfg_d, t_next_d, t_d, dt_d, cond_d, augment_labels, net) # [b_d, t, c, h, w]
+        # Calculate u_tgt when 0 < alpha <= 1 (target network: student or EMA teacher)
+        # NOTE: for alpha == 0 this helper internally takes the JVP of `target_net`; for EMA the whole
+        # target (base velocity_cfg and the JVP derivative) therefore comes from the teacher, i.e. no
+        # student/teacher mixing is possible.
+        mean_velocity_d = self._compute_mean_velocity_d(x_t_d, velocity_cfg_d, t_next_d, t_d, dt_d, cond_d, augment_labels, target_net) # [b_d, t, c, h, w]
 
         # NOTE on batch alignment. The official implementation concatenates the targets as
         # `cat([c-branch targets, d-branch targets])` and compares them to predictions computed in

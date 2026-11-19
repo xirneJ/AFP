@@ -35,8 +35,11 @@ Run from the repository root (GPU recommended):
     python scripts/check_state_equivalence.py
 """
 import copy
+import inspect
+import math
 import os
 import sys
+import tempfile
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -876,6 +879,255 @@ def section_d_sampling(net_v, net_s, cfg, device):
 
 
 # ---------------------------------------------------------------------------
+# F. EMA target teacher (Stage 2 / A2).
+# ---------------------------------------------------------------------------
+
+class _ForwardCounter:
+    """Counts forward calls of a module (used to verify which branches call the teacher)."""
+
+    def __init__(self, module):
+        self.count = 0
+        self.handle = module.register_forward_hook(self._hook, with_kwargs=True)
+
+    def _hook(self, module, args, kwargs, output):
+        _ = module, args, kwargs, output
+        self.count += 1
+
+    def close(self):
+        self.handle.remove()
+
+
+def _grads(module):
+    return {n: p.grad.detach().clone() for n, p in module.named_parameters() if p.grad is not None}
+
+
+def _named_params(module):
+    return dict(module.named_parameters())
+
+
+def _named_buffers(module):
+    return dict(module.named_buffers())
+
+
+def section_f_ema_teacher(net_v, net_s, cfg, device):
+    print('\n=== F. EMA target teacher (A2) verification ===')
+    from src.train import update_ema
+    import src.train as train_module
+    import src.training.network_utils as network_utils_module
+
+    b = 6
+    cond = net_s.construct_dummy_cond(b, device)
+    teacher = copy.deepcopy(net_s).to(device).eval().requires_grad_(False)
+    loss_shared = build_loss(cfg, device, 'state')
+    loss_ema = build_loss(cfg, device, 'state', target_branch='ema')
+    loss_ema.teacher = teacher
+
+    # --- F1. Initialisation: teacher == student bitwise (params + buffers), teacher frozen/eval ---
+    sp, tp = _named_params(net_s), _named_params(teacher)
+    sb, tb = _named_buffers(net_s), _named_buffers(teacher)
+    params_ok = set(sp) == set(tp) and all(torch.equal(sp[k], tp[k]) for k in sp)
+    common_buffers = [k for k in sb if k in tb and sb[k].dtype == tb[k].dtype]
+    buffers_ok = len(common_buffers) == len(sb) and all(torch.equal(sb[k], tb[k]) for k in common_buffers)
+    frozen_ok = (not teacher.training) and all(not p.requires_grad for p in teacher.parameters())
+    report('F1 teacher == student at init (params & buffers, bitwise)', params_ok and buffers_ok,
+           f'params_equal={params_ok}, buffers_equal={buffers_ok}')
+    report('F1 teacher is frozen (eval + requires_grad=False)', frozen_ok)
+
+    # --- F2. A1 vs A2 at init: targets / per-sample losses / which branches call the teacher ---
+    patterns = ['d', 'alpha0', 'fm', 'alpha1', 'mixed', 'd_all', 'alpha0_all']
+    for kind in patterns:
+        batch = make_batch(net_s, device, kind)
+        parts_shared = reference_parts(loss_shared, net_s, batch, cond)
+        parts_ema = reference_parts(loss_ema, teacher, batch, cond)
+        out_shared = production_forward(loss_shared, net_s, batch, cond)
+        counter = _ForwardCounter(teacher.model)
+        out_ema = production_forward(loss_ema, net_s, batch, cond)
+        teacher_calls = counter.count
+        counter.close()
+        d_targets = rel_diff(parts_ema.targets.ref, parts_shared.targets.ref)
+        d_loss = rel_diff(out_ema['total'], out_shared['total'])
+        report(f'[F2 {kind}] A1/A2 targets equal at init', d_targets < TOL_FP32, f'max rel diff = {d_targets:.3e}')
+        report(f'[F2 {kind}] A1/A2 per-sample loss equal at init', d_loss < TOL_FP32, f'max rel diff = {d_loss:.3e}')
+        is_fm_only = bool(torch.isclose(batch.t, batch.t_next).all())
+        is_alpha1_only = bool((torch.isclose(batch.dt / (batch.t - batch.t_next + 1e-30), torch.ones_like(batch.dt))).all())
+        if kind in ('fm', 'alpha1') or is_fm_only or is_alpha1_only:
+            report(f'[F2 {kind}] teacher is NOT called on this branch', teacher_calls == 0,
+                   f'teacher forward calls = {teacher_calls}')
+        else:
+            report(f'[F2 {kind}] teacher IS called on this branch', teacher_calls > 0,
+                   f'teacher forward calls = {teacher_calls}')
+
+    # --- F3. Student gradients identical (A1 vs A2); teacher gets no gradients ---
+    batch = make_batch(net_s, device, 'd_all')
+    net_s.zero_grad(set_to_none=True)
+    out_shared = production_forward(loss_shared, net_s, batch, cond)
+    out_shared['total'].mean().backward()
+    grads_shared = _grads(net_s)
+    teacher_grads = any(p.grad is not None for p in teacher.parameters())
+    net_s.zero_grad(set_to_none=True)
+    out_ema = production_forward(loss_ema, net_s, batch, cond)
+    out_ema['total'].mean().backward()
+    grads_ema = _grads(net_s)
+    teacher_grads = teacher_grads or any(p.grad is not None for p in teacher.parameters())
+    same_names = set(grads_shared) == set(grads_ema)
+    grad_diff = max((float((grads_shared[n] - grads_ema[n]).abs().max()) for n in grads_shared), default=0.0) if same_names else float('inf')
+    report('F3 student gradients identical for A1 and A2 (at init)', same_names and grad_diff < 1e-5,
+           f'{len(grads_shared)} tensors, max abs diff = {grad_diff:.3e}')
+    report('F3 teacher receives NO gradients', not teacher_grads)
+
+    # --- F4. Teacher is not in the optimizer ---
+    optimizer = torch.optim.Adam([p for p in net_s.parameters() if p.requires_grad], lr=1e-4)
+    optim_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+    teacher_ids = {id(p) for p in teacher.parameters()}
+    report('F4 teacher parameters are not in the optimizer', not (optim_ids & teacher_ids))
+    opt_src = inspect.getsource(network_utils_module.init_optimizers)
+    report('F4 init_optimizers only takes nets.net parameters (teacher not optimized)',
+           'nets.net.parameters()' in opt_src and 'loss_fn.teacher' not in opt_src)
+
+    # --- F5. EMA update formula, rampup & timing (t = optimizer step, not diffusion time) ---
+    cfg_t = copy.deepcopy(cfg)
+    cfg_t.model.ema_halflife_steps = 6931
+    cfg_t.model.ema_rampup_ratio = None
+    cfg_t.model.ema_update_freq = 1
+    net_a = copy.deepcopy(net_s).train()
+    teacher_a = copy.deepcopy(net_s).eval().requires_grad_(False)
+    old_p = {n: p.detach().clone() for n, p in teacher_a.named_parameters()}
+    with torch.no_grad():
+        for p in net_a.parameters():
+            p.add_(0.01)
+    beta, _, _ = update_ema(cfg_t, net_a, teacher_a, EasyDict(cur_step=100))
+    expected_beta = 0.5 ** (1.0 / 6931)
+    report('F5 decay formula beta == 0.5^(1/halflife)', abs(beta - expected_beta) < 1e-12,
+           f'beta={beta:.12f}, expected={expected_beta:.12f}')
+    lerp_err = 0.0
+    for n, p in teacher_a.named_parameters():
+        expected = old_p[n] * beta + net_a.get_parameter(n).detach() * (1.0 - beta)
+        lerp_err = max(lerp_err, float((p - expected).abs().max()))
+    report('F5 teacher <- beta*teacher_old + (1-beta)*student (params)', lerp_err < 1e-6,
+           f'max abs err = {lerp_err:.3e}')
+
+    # rampup: halflife_t = min(H, cur_step * rampup_ratio), t = optimizer step
+    cfg_t.model.ema_rampup_ratio = 0.05
+    net_b = copy.deepcopy(net_s).train()
+    teacher_b = copy.deepcopy(net_s).eval().requires_grad_(False)
+    beta_ramp, _, _ = update_ema(cfg_t, net_b, teacher_b, EasyDict(cur_step=10))
+    expected_ramp = 0.5 ** (1.0 / 0.5)
+    report('F5 rampup halflife == min(H, optimizer_step * rampup_ratio)', abs(beta_ramp - expected_ramp) < 1e-12,
+           f'step=10, H_t=0.5 -> beta={beta_ramp:.6f}, expected={expected_ramp:.6f}')
+
+    train_src_path = inspect.getsourcefile(train_module)
+    with open(train_src_path, encoding='utf-8') as f:
+        train_src = f.read()
+    has_freq_rule = 'should_update_ema = stats.cur_step % cfg.model.ema_update_freq == 0' in train_src
+    idx_opt_step = train_src.index('optimizers.optimizer.step()')
+    idx_teacher_update = train_src.index('cfg, nets.net, loss_fn.teacher, stats,')
+    report('F5 timing: optimizer.step -> teacher EMA update, using optimizer-step counter',
+           has_freq_rule and idx_opt_step < idx_teacher_update,
+           f'freq_rule_found={has_freq_rule}, step_idx={idx_opt_step}, teacher_update_idx={idx_teacher_update}')
+
+    # --- F6. alpha=0 JVP: derivative must come from the teacher (no teacher-base + student-JVP mix) ---
+    with torch.no_grad():
+        for p in teacher.parameters():
+            p.add_(0.05) # make teacher != student to expose mixing
+    batch = make_batch(net_s, device, 'alpha0')
+    is_fm = torch.isclose(batch.t, batch.t_next).flatten()
+    jvp_mask = ((batch.dt.flatten() == 0) & (~is_fm))
+    d_interval = (batch.t - batch.t_next)
+    parts_teacher = reference_parts(loss_ema, teacher, batch, cond)
+    parts_student = reference_parts(loss_shared, net_s, batch, cond)
+    # For alpha=0: u_tgt = v_cfg - (t-r) * JVP  =>  JVP = (v_cfg - u_tgt) / (t-r)
+    jvp_teacher = (parts_teacher.velocity_cfg[jvp_mask] - parts_teacher.targets.ref[jvp_mask]) / d_interval[jvp_mask]
+    jvp_student = (parts_student.velocity_cfg[jvp_mask] - parts_student.targets.ref[jvp_mask]) / d_interval[jvp_mask]
+    # "Mixed" target: teacher velocity_cfg as the base velocity + student JVP as the derivative.
+    mixed_c = loss_ema._compute_mean_velocity_c(
+        parts_teacher.x_t[jvp_mask], batch.t_next[jvp_mask], batch.t[jvp_mask],
+        parts_teacher.velocity_cfg[jvp_mask], cond[jvp_mask], None, net_s)
+    jvp_mixed = (parts_teacher.velocity_cfg[jvp_mask] - mixed_c) / d_interval[jvp_mask]
+    d_teacher_vs_student = rel_diff(jvp_teacher, jvp_student)
+    d_mixed_vs_student = rel_diff(jvp_mixed, jvp_student)
+    report('F6 JVP branch: the JVP derivative used by A2 comes from the teacher',
+           d_teacher_vs_student > TOL_DIFF, f'rel diff(teacher JVP, student JVP) = {d_teacher_vs_student:.3e}')
+    report('F6 JVP branch: "mixed" (teacher base + student JVP) is NOT what A2 uses',
+           d_mixed_vs_student < TOL_DIFF and d_teacher_vs_student > TOL_DIFF,
+           f'rel diff(mixed JVP, student JVP) = {d_mixed_vs_student:.3e} (mixed really mixes)')
+
+    # --- F7. CFG: both conditional and unconditional target evaluations use the teacher ---
+    cfg_params = EasyDict(omega=0.5, kappa=0.2, t_min=0.0, t_max=1.0) # 1-omega-kappa != 0 -> uncond path active
+    loss_shared_cfg = build_loss(cfg, device, 'state', cfg_params=cfg_params)
+    loss_ema_cfg = build_loss(cfg, device, 'state', target_branch='ema', cfg_params=cfg_params)
+    loss_ema_cfg.teacher = teacher
+    batch = make_batch(net_s, device, 'd')
+    parts_shared_cfg = reference_parts(loss_shared_cfg, net_s, batch, cond)
+    parts_ema_cfg = reference_parts(loss_ema_cfg, teacher, batch, cond)
+    d_cfg = rel_diff(parts_ema_cfg.velocity_cfg, parts_shared_cfg.velocity_cfg)
+    report('F7 CFG: teacher-guided velocity differs from student-guided velocity (teacher used)',
+           d_cfg > TOL_DIFF, f'rel diff = {d_cfg:.3e}')
+    counter = _ForwardCounter(teacher.model)
+    _ = production_forward(loss_ema_cfg, net_s, batch, cond)
+    cfg_calls = counter.count
+    counter.close()
+    # d pattern: 1 uncond + 1 cond (velocity_cfg) + 1 d-branch u^- target = 3 teacher forwards
+    report('F7 CFG: both cond and uncond target evaluations use the teacher', cfg_calls >= 3,
+           f'teacher forward calls = {cfg_calls} (expected >= 3)')
+
+    # --- F8. alpha=1 target skip and FM branch do not call the teacher (non-cfg recipes) ---
+    for kind in ('alpha1', 'fm'):
+        batch = make_batch(net_s, device, kind)
+        counter = _ForwardCounter(teacher.model)
+        _ = production_forward(loss_ema, net_s, batch, cond)
+        calls = counter.count
+        counter.close()
+        report(f'F8 [{kind}] no teacher forward call (target branch skipped / FM uses velocity head)',
+               calls == 0, f'teacher forward calls = {calls}')
+
+    # --- F9. Snapshot: teacher state saves/loads bitwise; save/load code includes the teacher key ---
+    teacher_sd = {k: v.detach().cpu().clone() for k, v in teacher.state_dict().items()}
+    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+        tmp_path = f.name
+    try:
+        torch.save({'teacher': teacher_sd}, tmp_path)
+        loaded = torch.load(tmp_path, map_location='cpu', weights_only=False)['teacher']
+    finally:
+        os.remove(tmp_path)
+    teacher_rt = copy.deepcopy(net_s).eval().requires_grad_(False)
+    teacher_rt.load_state_dict(loaded)
+    rt_ok = _named_params(teacher_rt).keys() == _named_params(teacher).keys() and all(
+        torch.equal(teacher_rt.state_dict()[k].cpu(), teacher_sd[k]) for k in teacher_sd)
+    report('F9 teacher snapshot save/load round-trip is bitwise exact', rt_ok)
+    save_src = inspect.getsource(network_utils_module.save_snapshot)
+    init_src = inspect.getsource(network_utils_module.init_modules)
+    report('F9 snapshot code saves teacher and resume code loads it',
+           "'teacher'" in save_src and "snapshot.get('teacher')" in init_src)
+
+    # --- F10. Evaluation EMA and target EMA are independent; no parameter mixing ---
+    eval_ema = copy.deepcopy(net_s).eval() # stands in for nets.ema
+    report('F10 target EMA is a separate module from the evaluation EMA',
+           teacher is not net_s and teacher is not eval_ema and loss_ema.teacher is teacher)
+    # Updating the teacher must not change the evaluation EMA, and vice versa.
+    eval_ema_before = {k: v.detach().clone() for k, v in eval_ema.named_parameters()}
+    _ = update_ema(cfg_t, net_a, teacher, EasyDict(cur_step=200))
+    eval_unchanged = all(torch.equal(eval_ema_before[k], v) for k, v in eval_ema.named_parameters())
+    report('F10 teacher EMA update does not modify the evaluation EMA', eval_unchanged)
+    # Perturbing the evaluation EMA must not change the A2 loss (target uses teacher only).
+    batch = make_batch(net_s, device, 'd_all')
+    out_before = production_forward(loss_ema, net_s, batch, cond)
+    with torch.no_grad():
+        for p in eval_ema.parameters():
+            p.add_(0.1)
+    out_after = production_forward(loss_ema, net_s, batch, cond)
+    d_eval_perturb = rel_diff(out_after['total'], out_before['total'])
+    report('F10 perturbing the evaluation EMA does NOT change the A2 loss', d_eval_perturb < TOL_FP32,
+           f'rel diff = {d_eval_perturb:.3e}')
+    # Snapshot data separation: net / ema / teacher are distinct tensors.
+    snap = {'net': net_s.state_dict(), 'ema': eval_ema.state_dict(), 'teacher': teacher.state_dict()}
+    ema_vs_teacher = max(float((snap['ema'][k].float() - snap['teacher'][k].float()).abs().max())
+                         for k in snap['ema'] if k in snap['teacher'] and snap['ema'][k].dtype.is_floating_point)
+    report('F10 snapshot keeps net / evaluation EMA / target EMA as distinct states',
+           set(snap.keys()) == {'net', 'ema', 'teacher'} and ema_vs_teacher > 0.0,
+           f'max |ema - teacher| = {ema_vs_teacher:.3e}')
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     disable_trivial_warnings()
@@ -897,6 +1149,7 @@ def main():
     section_c_gradients(net_v, net_s, cfg, device)
     section_d_sampling(net_v, net_s, cfg, device)
     section_e_combinations(net_v, net_s, cfg, device)
+    section_f_ema_teacher(net_v, net_s, cfg, device)
 
     print()
     failed = [name for name, ok, _ in RESULTS if not ok]
