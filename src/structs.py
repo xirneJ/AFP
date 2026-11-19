@@ -20,7 +20,10 @@ from collections import namedtuple
 
 import numpy as np
 import torch
-from torch.distributed.fsdp import ShardingStrategy
+try:
+    from torch.distributed.fsdp import ShardingStrategy
+except Exception:  # FSDP v1 may be unavailable on very new PyTorch builds; not needed for single-GPU runs.
+    ShardingStrategy = None
 from beartype import beartype
 from omegaconf import DictConfig, ListConfig
 
@@ -354,12 +357,20 @@ DTYPE_STRING_TO_DTYPE = {
     None: None,
 }
 
-FSDP_STRATEGY_STRING_TO_FSDP_STRATEGY = {
-    'full_shard': ShardingStrategy.FULL_SHARD,
-    'shard_grad_op': ShardingStrategy.SHARD_GRAD_OP,
-    'no_shard': ShardingStrategy.NO_SHARD,
-    'hybrid_shard': ShardingStrategy.HYBRID_SHARD,
-}
+if ShardingStrategy is not None:
+    FSDP_STRATEGY_STRING_TO_FSDP_STRATEGY = {
+        'full_shard': ShardingStrategy.FULL_SHARD,
+        'shard_grad_op': ShardingStrategy.SHARD_GRAD_OP,
+        'no_shard': ShardingStrategy.NO_SHARD,
+        'hybrid_shard': ShardingStrategy.HYBRID_SHARD,
+    }
+else:  # single-GPU fallback: keep the names so configs still compose
+    FSDP_STRATEGY_STRING_TO_FSDP_STRATEGY = {
+        'full_shard': 'full_shard',
+        'shard_grad_op': 'shard_grad_op',
+        'no_shard': 'no_shard',
+        'hybrid_shard': 'hybrid_shard',
+    }
 
 NUMPY_INTEGER_TYPES = [np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64]
 NUMPY_FLOAT_TYPES = [np.float16, np.float32, np.float64, np.single, np.double]

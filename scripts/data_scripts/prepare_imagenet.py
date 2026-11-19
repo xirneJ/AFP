@@ -239,24 +239,37 @@ def main():
     parser.add_argument("--mode", choices=["symlink", "copy", "move"], default="symlink",
                         help="how to place images in the flat layout (default: symlink)")
     parser.add_argument("--delete-archives", action="store_true", help="delete the official .tar files after extraction")
+    parser.add_argument("--splits", nargs="+", choices=["train", "val"], default=["train", "val"],
+                        help="which splits to prepare (default: both). Use `--splits val` to only prepare the "
+                             "validation set -- that is enough to compute FID for the released checkpoints "
+                             "without downloading the 138 GB training split.")
     args = parser.parse_args()
 
     target = os.path.abspath(args.target_directory)
     os.makedirs(target, exist_ok=True)
+
+    splits = list(dict.fromkeys(args.splits))
+    want_train = "train" in splits
+    want_val = "val" in splits
 
     train_archive = os.path.join(target, "ILSVRC2012_img_train.tar")
     val_archive = os.path.join(target, "ILSVRC2012_img_val.tar")
     train_dir = os.path.join(target, "train")
     val_dir = os.path.join(target, "val")
 
+    def split_is_flat(d: str) -> bool:
+        return count_images(d) > 0 and not has_class_dirs(d)
+
     # --- 0. already prepared? --------------------------------------------------
-    if count_images(train_dir) > 0 and not has_class_dirs(train_dir):
-        print(f"Dataset already prepared at {target} (train: {count_images(train_dir)} images). Nothing to do.")
+    if all(split_is_flat(os.path.join(target, s)) for s in splits):
+        print(f"Dataset already prepared at {target} for split(s) {splits}. Nothing to do.")
         print("Run: python scripts/check_setup.py")
         return 0
 
     # --- 1. downloads (only if needed) -----------------------------------------
-    need_train_archive = count_images(train_dir) == 0 and not has_class_dirs(train_dir)
+    need_train_archive = want_train and count_images(train_dir) == 0 and not has_class_dirs(train_dir)
+    need_val_archive = want_val and count_images(val_dir) == 0 and not has_class_dirs(val_dir)
+
     if need_train_archive and not os.path.isfile(train_archive) and not args.skip_download:
         print("=" * 78)
         print("NOTE: image-net.org requires a (free) login. If the download below fails,")
@@ -267,50 +280,56 @@ def main():
         print("=" * 78)
         download(TRAIN_URL, train_archive)
 
-    need_val = count_images(val_dir) == 0 and not has_class_dirs(val_dir)
-    if need_val and not os.path.isfile(val_archive) and not args.skip_download:
+    if need_val_archive and not os.path.isfile(val_archive) and not args.skip_download:
         download(VAL_URL, val_archive)
 
     # --- 2. extraction ----------------------------------------------------------
-    if need_train_archive:
-        if not check_is_tar(train_archive):
-            print(f"[ERROR] {train_archive} is missing or is not a tar archive.")
-            print("        Place ILSVRC2012_img_train.tar there, then rerun with --skip-download.")
-            return 1
-        extract_train(target, train_archive)
-        if args.delete_archives:
-            os.remove(train_archive)
-    elif has_class_dirs(train_dir):
-        print(f"--- Using already-extracted training data at {train_dir}")
-
-    if need_val:
-        if check_is_tar(val_archive):
-            extract_val(target, val_archive)
+    if want_train:
+        if has_class_dirs(train_dir):
+            print(f"--- Using already-extracted training data at {train_dir}")
+        elif need_train_archive:
+            if not check_is_tar(train_archive):
+                print(f"[ERROR] {train_archive} is missing or is not a tar archive.")
+                print("        Place ILSVRC2012_img_train.tar there, then rerun with --skip-download.")
+                print("        (If you only need FID for the released checkpoints, use `--splits val`!)")
+                return 1
+            extract_train(target, train_archive)
             if args.delete_archives:
-                os.remove(val_archive)
-        elif os.path.isdir(val_dir):
-            pass  # raw val images may already be extracted; handled below
-        else:
-            print(f"[WARN] Validation data not found at {val_dir}; training will skip validation/FID.")
+                os.remove(train_archive)
 
-    if os.path.isdir(val_dir) and not has_class_dirs(val_dir) and count_images(val_dir) > 0:
-        sort_val_with_valprep(val_dir)
+    if want_val:
+        if has_class_dirs(val_dir):
+            print(f"--- Using already-sorted validation data at {val_dir}")
+        elif need_val_archive:
+            if check_is_tar(val_archive):
+                extract_val(target, val_archive)
+                if args.delete_archives:
+                    os.remove(val_archive)
+            elif os.path.isdir(val_dir):
+                pass  # raw val images may already be extracted; handled below
+            else:
+                print(f"[WARN] Validation data not found at {val_dir}.")
+        if os.path.isdir(val_dir) and not has_class_dirs(val_dir) and count_images(val_dir) > 0:
+            sort_val_with_valprep(val_dir)
 
     # --- 3. reorganize ----------------------------------------------------------
-    print(f"\n--- Reorganizing into the folder + .meta.json layout (mode={args.mode})")
+    print(f"\n--- Reorganizing into the folder + .meta.json layout (mode={args.mode}, splits={splits})")
     class_ids = build_class_ids(target)
     if not class_ids:
         print("[ERROR] No class folders found; cannot build ImageNet class ids.")
         return 1
     if len(class_ids) != 1000:
         print(f"[WARN] Found {len(class_ids)} classes (expected 1000).")
-    prepare_split(target, "train", args.mode, class_ids)
-    if os.path.isdir(val_dir):
-        prepare_split(target, "val", args.mode, class_ids)
+    for split in splits:
+        split_dir = os.path.join(target, split)
+        if os.path.isdir(split_dir):
+            prepare_split(target, split, args.mode, class_ids)
+        else:
+            print(f"    [{split}] not found, skipping.")
 
     print("\n--- Done")
-    print(f"    train: {count_images(train_dir)} images")
-    print(f"    val:   {count_images(val_dir)} images")
+    for split in splits:
+        print(f"    {split}: {count_images(os.path.join(target, split))} images")
     print("    Next: python scripts/check_setup.py")
     return 0
 

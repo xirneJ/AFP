@@ -8,9 +8,12 @@ from typing import Union, Any, Optional
 from dataclasses import asdict, replace
 
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp.api import FullOptimStateDictConfig
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+    from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+    from torch.distributed.fsdp.api import FullOptimStateDictConfig
+except Exception:  # FSDP v1 may be unavailable on very new PyTorch builds (single-GPU runs don't need it).
+    FSDP = StateDictType = FullStateDictConfig = ShardedGradScaler = FullOptimStateDictConfig = None
 from omegaconf import OmegaConf, DictConfig
 
 try:

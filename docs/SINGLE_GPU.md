@@ -233,6 +233,15 @@ python scripts/data_scripts/prepare_imagenet.py --target_directory ./data/imagen
 
 `check_setup.py` 会检查它是否准备好。
 
+> **只跑 released 权重的 FID 时不需要训练集**：FID 只需要真实数据的 **val 50k**。
+> 下载 `ILSVRC2012_img_val.tar`（6.3 GB）放到 `data/imagenet/` 后：
+> ```bash
+> python scripts/data_scripts/prepare_imagenet.py --target_directory ./data/imagenet \
+>   --skip-download --splits val
+> ```
+> 评测时再用 `DATA_SRC=$PWD/data/imagenet/val/` 让真实分布也指向 val 即可
+> （见第 6 节）。完整训练才需要 train split（~138 GB）。
+
 ### 5.2 启动训练（三种对照实验已内置）
 
 ```bash
@@ -322,7 +331,7 @@ bash scripts/evaluate_single_gpu.sh runs/ft-alphaflow-base/generate/nfe1
 - `fcd50k_full` 需要先 `pip install git+https://github.com/openai/CLIP.git`。
 
 > 只有 val 数据时：`DATA_SRC=$PWD/data/imagenet/val/ bash scripts/evaluate_single_gpu.sh ...`
-> （训练集目录不存在时用它顶替真实数据来源）。
+> （训练集目录不存在时用它顶替真实数据来源；FID 只需要 val 50k）。
 >
 > 想和论文 `evaluate.sh` 的默认协议完全一致（真实分布用 1.28M 训练图，首次统计要几小时）：
 > `VAL_SPLIT=0 bash scripts/evaluate_single_gpu.sh <gen_dir>`。

@@ -151,7 +151,7 @@ REQUIRED_PACKAGES = [
     "numpy", "scipy", "PIL", "tqdm", "einops", "beartype", "loguru",
     "hydra", "omegaconf", "click", "yaml", "requests", "git", "wandb",
     "psutil", "termcolor", "torchmetrics", "lpips", "timm", "fvcore",
-    "torch_dct", "av", "diffusers", "accelerate",
+    "torch_dct", "av", "diffusers", "accelerate", "torchvision",
 ]
 OPTIONAL_PACKAGES = ["clip", "matplotlib"]
 

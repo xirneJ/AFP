@@ -11,7 +11,11 @@ from typing import Any, Iterable, Optional, Union, Callable, ContextManager, Seq
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+except Exception:  # FSDP v1 may be unavailable on very new PyTorch builds; single-GPU runs don't need it.
+    class FSDP:  # noqa: N801 - dummy class so isinstance(...) checks safely return False
+        pass
 import einops
 from fvcore.nn import FlopCountAnalysis
 
