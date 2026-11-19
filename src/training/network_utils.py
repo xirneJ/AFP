@@ -55,12 +55,46 @@ def init_modules(cfg, device, data: Data, start_time, resume_cfg: ResumeConfig, 
     return nets, optimizers, loss_fn, vis, stats
 
 
+def init_state_head_from_velocity_(net: torch.nn.Module) -> int:
+    """Copies the negated velocity head into the state head.
+
+    With the "state" parameterization the wrapper returns
+        f_theta(z_t, r, t) = z_t + (t-r) * raw_state(z_t, r, t),
+    so setting raw_state == -u_theta makes
+        f_theta(z_t, r, t) == z_t - (t-r) * u_theta(z_t, r, t)
+    exactly at initialisation. This is what makes stage 1 a *strict* reparameterization
+    of the velocity model instead of a different function.
+    """
+    unwrapped = misc.unwrap_module(net)
+    num_initialized = 0
+    for module in unwrapped.modules():
+        linear = getattr(module, 'linear', None)
+        linear_state = getattr(module, 'linear_state', None)
+        if isinstance(linear, torch.nn.Linear) and isinstance(linear_state, torch.nn.Linear):
+            linear_state.load_state_dict(linear.state_dict())
+            with torch.no_grad():
+                linear_state.weight.neg_()
+                if linear_state.bias is not None:
+                    linear_state.bias.neg_()
+            num_initialized += 1
+    return num_initialized
+
+
 def init_networks(cfg, device) -> Nets:
     dist.loginfo0('Constructing network... ')
     interface_kwargs = dict(resolution=cfg.dataset.resolution, img_channels=3, label_shape=cfg.dataset.label_shape)
     network_kwargs, _ = instantiate_network_kwargs(cfg)
 
     net: torch.nn.Module = construct_class_by_name(**network_kwargs, **interface_kwargs)
+    # For the state parameterization, initialise the second head from the (negated) velocity head
+    # BEFORE the EMA copy is created and before any checkpoint is loaded:
+    #   - a fresh model starts as an exact reparameterization of the velocity model;
+    #   - loading a released checkpoint (which has no state head) leaves it negated;
+    #   - resuming our own run loads the trained state head and overwrites this initialisation.
+    if str(cfg.model.get('parameterization', 'velocity')) == 'state' and \
+            str(cfg.model.get('state_head_init', 'negate_velocity')) == 'negate_velocity':
+        num_initialized = init_state_head_from_velocity_(net)
+        dist.loginfo0(f'Initialized {num_initialized} state head(s) as -velocity head (strict reparameterization).')
     dist.maybe_sync_state(net)
     net.cpu().train().requires_grad_(True).to(dtype=DTYPE_STRING_TO_DTYPE[cfg.model.param_dtype])
     if cfg.model.is_lgm and hasattr(net, 'autoencoder') and isinstance(net.autoencoder, torch.nn.Module):
@@ -274,6 +308,17 @@ def load_module_state(cfg, module: torch.nn.Module, snapshot, name: str, resume_
             f'parameters in module {name}: {params_to_reinit - reinited_new_params}'
 
     dist.loginfo0(f'Loaded {name}. Num missing keys: {len(incompatible_keys.missing_keys)}. Num unexpected keys: {len(incompatible_keys.unexpected_keys)}.')
+
+    # If we load a checkpoint that predates the state parameterization (e.g. the released
+    # alphaflow checkpoints), the dual head is not present in the snapshot. Re-initialise it
+    # from the *loaded* velocity head so that the model starts as an exact reparameterization.
+    if str(cfg.model.get('parameterization', 'velocity')) == 'state' and \
+            str(cfg.model.get('state_head_init', 'negate_velocity')) == 'negate_velocity':
+        missing_keys = getattr(incompatible_keys, 'missing_keys', None) or []
+        if any('linear_state' in k for k in missing_keys):
+            num_initialized = init_state_head_from_velocity_(module)
+            dist.loginfo0(f'Re-initialized {num_initialized} state head(s) from the loaded velocity head '
+                          f'(the checkpoint has no state head).')
 
 
 def save_snapshot(cfg, nets: Nets, optimizers: Optimizers, data: Data, stats: logging_utils.TrainingStats, vis, snapshot_path, reason: str='', save_non_empty_optim: bool=True) -> str:

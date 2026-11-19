@@ -12,6 +12,27 @@ from src.utils import misc
 
 #----------------------------------------------------------------------------
 
+def from_pretrained_or_config(model_class, pretrained_model_name_or_path: str, **kwargs):
+    """Loads a diffusers model, falling back to a config-only construction.
+
+    For the released AlphaFlow checkpoints the actual VAE weights come from the
+    local snapshot (e.g. ./snapshots/sd_vae_ft_ema.pt), so the HuggingFace weights
+    are only needed to instantiate the architecture. If the HF weight download is
+    unavailable/slow (e.g. the xet CDN is blocked), we build the model from its
+    config and let load_snapshot() fill in the weights afterwards.
+    """
+    try:
+        return model_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f'[WARN] from_pretrained("{pretrained_model_name_or_path}") failed '
+            f'({type(e).__name__}: {str(e)[:200]}). Falling back to a config-only init; '
+            f'the weights will be loaded from the local checkpoint.'
+        )
+        config = model_class.load_config(pretrained_model_name_or_path)
+        return model_class.from_config(config)
+
+
 def init_diffusers_ae(
         ae_name: str,
         model_variant: str | None=None,
@@ -53,7 +74,9 @@ def init_diffusers_ae(
         compression_rate = [1, 8, 8]
     elif ae_name == 'sd_vae_ft_ema':
         model_class = AutoencoderKL
-        model = model_class.from_pretrained("stabilityai/sd-vae-ft-ema")
+        # Weights are loaded from the local AlphaFlow snapshot afterwards, so only the
+        # architecture/config is strictly required here (see from_pretrained_or_config).
+        model = from_pretrained_or_config(model_class, "stabilityai/sd-vae-ft-ema")
         param_dtype = None
         model = maybe_reinit_diffusers_ae(model, model_class, param_dtype=param_dtype, **reinit_kwargs)
         latent_channels = model.config.latent_channels

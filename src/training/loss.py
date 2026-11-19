@@ -574,22 +574,71 @@ class AlphaFlowLoss(RecFlowLoss):
         # Calculate u_tgt when 0 < alpha <= 1
         mean_velocity_d = self._compute_mean_velocity_d(x_t_d, velocity_cfg_d, t_next_d, t_d, dt_d, cond_d, augment_labels, net) # [b_d, t, c, h, w]
 
-        mean_velocity = torch.cat([mean_velocity_c, mean_velocity_d], dim=0) # [b, t, c, h, w]
+        # NOTE: the original implementation concatenated [c-samples, d-samples] and compared it
+        # against predictions computed in the original batch order. That is only equivalent when
+        # `mask_c` is a *prefix* of the batch. It is not the case when alpha gets clamped to 0
+        # (then some mean-flow samples move into the c-branch and get scattered through the batch),
+        # which silently pairs predictions with wrong targets. We assemble the targets back into the
+        # original sample order instead (identical to the original behavior whenever mask_c is a prefix).
+        mean_velocity = torch.empty(x_t.shape, device=x_t.device, dtype=mean_velocity_d.dtype if batch_size_d > 0 else mean_velocity_c.dtype) # [b, t, c, h, w]
+        if batch_size_c > 0:
+            mean_velocity[mask_c] = mean_velocity_c # [b_c, t, c, h, w]
+        if batch_size_d > 0:
+            mean_velocity[mask_d] = mean_velocity_d # [b_d, t, c, h, w]
 
-        pred_mean_velocity, ctx = net(
-            x_t,
-            sigma_next=t_next,
-            sigma=t,
-            cond=cond,
-            augment_labels=augment_labels,
-            return_extra_output=True
-        ) # [b, t, c, h, w]
+        state_param = str(self.cfg.model.get('parameterization', 'velocity')) == 'state'
+        if not state_param:
+            pred_mean_velocity, _ctx = net(
+                x_t,
+                sigma_next=t_next,
+                sigma=t,
+                cond=cond,
+                augment_labels=augment_labels,
+                return_extra_output=True
+            ) # [b, t, c, h, w]
+            loss_unscaled = ((pred_mean_velocity - mean_velocity) ** 2).flatten(1).mean(1) # [b]
+        else:
+            # ------------------------------------------------------------------
+            # State parameterization (stage 1): strictly equivalent reparameterization.
+            #
+            #  * samples with r == t (the FM branch of `ratio_fm`) keep the velocity parameterization,
+            #    since f_theta(z_t, t, t) == z_t carries no signal and (t-r) would be zero;
+            #  * every other sample (t > r) predicts the endpoint state with the second head:
+            #        f_theta(z_t, r, t) = z_t - (t-r) * u_theta(z_t, r, t),
+            #    and the un-scaled residual is written in state space and divided by (t-r)^2:
+            #        ||f - f_tgt||^2 / (t-r)^2 == ||u - u_tgt||^2,
+            #    so the adaptive weighting below stays exactly the same as in the velocity model.
+            # ------------------------------------------------------------------
+            is_fm = torch.isclose(t, t_next).flatten() # [b]
+            is_mf = ~is_fm # [b]
 
-        ## Adaptive loss
-        loss_unscaled = ((pred_mean_velocity - mean_velocity) ** 2).flatten(1).mean(1) # [b]
-        weight_c = torch.ones(batch_size_c, device=velocity.device) # [b_c]
-        weight_d = torch.ones(batch_size_d, device=velocity.device) * alpha # [b_d]
-        weight = torch.cat([weight_c, weight_d], dim=0) / (loss_unscaled.detach() + self.cfg.adaptive_loss_weight_eps) # [b]
+            pred_mean_velocity = torch.empty(x_t.shape, device=x_t.device, dtype=torch.float32) # [b, t, c, h, w] velocity-equivalent prediction (used by logging)
+            loss_unscaled = torch.empty(batch_size, device=x_t.device, dtype=torch.float32) # [b]
+
+            if is_mf.any():
+                interval = (t - t_next)[is_mf] # [b_mf, 1, 1, 1, 1] = t - r > 0
+                assert torch.all(interval > 0), "State parameterization requires t > r on the consistency branch."
+                pred_state, _ctx = net(
+                    x_t[is_mf], sigma=t[is_mf], sigma_next=t_next[is_mf], cond=cond[is_mf],
+                    augment_labels=augment_labels, head='state', return_extra_output=True,
+                ) # [b_mf, t, c, h, w] = f_theta(z_t, r, t)
+                f_target = x_t[is_mf] - interval * mean_velocity[is_mf] # [b_mf, t, c, h, w] = z_t - (t-r) u_tgt = z_r^hat
+                loss_unscaled[is_mf] = ((pred_state - f_target) ** 2 / interval ** 2).flatten(1).mean(1) # [b_mf]
+                pred_mean_velocity[is_mf] = (x_t[is_mf] - pred_state) / interval # [b_mf, t, c, h, w]
+
+            if is_fm.any():
+                pred_fm, _ctx = net(
+                    x_t[is_fm], sigma=t[is_fm], sigma_next=t_next[is_fm], cond=cond[is_fm],
+                    augment_labels=augment_labels, return_extra_output=True,
+                ) # [b_fm, t, c, h, w]
+                loss_unscaled[is_fm] = ((pred_fm - mean_velocity[is_fm]) ** 2).flatten(1).mean(1) # [b_fm]
+                pred_mean_velocity[is_fm] = pred_fm # [b_fm, t, c, h, w]
+
+        ## Adaptive loss (unchanged weighting: 1 for the c-branch samples and `alpha` for the d-branch ones)
+        weight = torch.ones(batch_size, device=velocity.device, dtype=loss_unscaled.dtype) # [b]
+        if batch_size_d > 0:
+            weight[mask_d] = alpha # [b_d]
+        weight = weight / (loss_unscaled.detach() + self.cfg.adaptive_loss_weight_eps) # [b]
         loss = weight * loss_unscaled # [b]
 
         ## Compute trajectory flow matching loss

@@ -188,9 +188,48 @@ def reverse_recflow_step(
     ) -> tuple[TensorLike, TensorLike]:
     _ = step_idx, randn_like, t_next, num_steps # For compatibility with reverse_edm_step.
 
+    net_bare = misc.unwrap_module(net)
+    state_param = str(net_bare.cfg.get('parameterization', 'velocity')) == 'state'
+
     delta_t = t_cur - t_next # [b, 1, 1, 1, 1]
     sigma_next = torch.zeros_like(t_next) if sampling_cfg.enable_consistency_sampling else t_next
-    model_kwargs.update({"sigma_next": sigma_next} if sampling_cfg.enable_trajectory_sampling else {})
+    if sampling_cfg.enable_trajectory_sampling or state_param:
+        # The state head needs `sigma_next` (the target time r) unconditionally.
+        model_kwargs.update({"sigma_next": sigma_next})
+
+    if state_param:
+        # State parameterization: the network directly predicts z_r (r = sigma_next), i.e.
+        # f_theta(z_t, r, t) = z_t - (t-r) u_theta(z_t, r, t). No extra NFE is needed:
+        # the velocity (needed for x_denoised and consistency steps) is recovered analytically.
+        z_target, extra_output = net(x_cur, sigma=t_cur, head='state', sc_latents=sc_latents, return_extra_output=True, **model_kwargs) # [b, t, c, h, w]
+        z_target = z_target.to(dtype) # [b, t, c, h, w]
+        sc_latents = extra_output.sc_latents if use_sc_latents else None # [b, lat_count, lat_dim]
+
+        # Applying CFG (supports batch-wise and spatio-temporal difference). Guidance is applied
+        # in velocity space and then converted back into the state prediction.
+        t_cur_item = t_cur[0].item() if isinstance(t_cur, torch.Tensor) else next(iter(t_cur[0].values())).item() # [1]
+        cur_cfg_scale = sampling_cfg.cfg.scale if sampling_cfg.cfg.t_min <= t_cur_item <= sampling_cfg.cfg.t_max else 1.0 # [1]
+        if cur_cfg_scale != 1.0:
+            z_target_uncond, _ = net(x_cur, sigma=t_cur, head='state', force_label_dropout=True, sc_latents=sc_latents, return_extra_output=True, **model_kwargs) # [b, t, c, h, w]
+            denom = t_cur - sigma_next # [b, 1, 1, 1, 1]
+            velocity_cond = (x_cur - z_target) / denom
+            velocity_uncond = (x_cur - z_target_uncond.to(dtype)) / denom
+            velocity_cfg = velocity_uncond + cur_cfg_scale * (velocity_cond - velocity_uncond) # [b, t, c, h, w]
+            z_target = x_cur - denom * velocity_cfg # [b, t, c, h, w]
+
+        if not sampling_cfg.enable_consistency_sampling:
+            # The network output IS the next state z_{t_next}. This is equivalent to the Euler step
+            # x_cur - delta_t * v with v = (x_cur - z_target) / delta_t.
+            velocity_cur = (x_cur - z_target) / delta_t # [b, t, c, h, w]
+            x_denoised = x_cur - t_cur * velocity_cur # [b, t, c, h, w]
+            x_next = z_target # [b, t, c, h, w]
+        else:
+            # consistency sampling steps in reverse time (the target time is r=0 here)
+            x_denoised = z_target # [b, t, c, h, w]
+            x_next = (1 - t_next) * x_denoised + t_next * randn_like(x_denoised) # [b, t, c, h, w]
+
+        return x_next, x_denoised, sc_latents
+
     velocity_cur, extra_output = net(x_cur, sigma=t_cur, sc_latents=sc_latents, return_extra_output=True, **model_kwargs) # [b, t, c, h, w], <any>
 
     # Applying CFG (supports batch-wise and spatio-temporal difference).

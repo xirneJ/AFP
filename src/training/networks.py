@@ -193,7 +193,7 @@ class Diffusion(BaseNetwork):
 
         return c_skip, c_out, c_in, noise_labels
 
-    def _construct_input(self, x_noised: torch.Tensor | None, sigma: torch.Tensor | None, sigma_next: torch.Tensor | None, force_fp32: bool=False):
+    def _construct_input(self, x_noised: torch.Tensor | None, sigma: torch.Tensor | None, sigma_next: torch.Tensor | None, force_fp32: bool=False, head: str='velocity'):
         force_dtype = self._decide_dtype(force_fp32) # torch.dtype or None
         if sigma is not None:
             c_skip, c_out, c_in, noise_labels = self._get_scaling_factors(sigma) # [b, ...], [b, ...], [b, ...], [b, ...]
@@ -208,6 +208,18 @@ class Diffusion(BaseNetwork):
         else:
             noise_labels_next = None # [b, ...].
 
+        if head == 'state':
+            # State parameterization: the wrapper returns f_theta(z_t, r, t) = z_t - (t-r) * u_theta(z_t, r, t).
+            # The second ("state") head of the backbone outputs -u, hence with c_skip=1 and
+            # c_out=(t-r) we directly get f. This requires the interval length (t-r), which is
+            # exactly `noise_labels_next` for the alphaflow preconditioning.
+            assert self.cfg.precond == 'alphaflow', f"State parameterization requires precond=alphaflow, got {self.cfg.precond}"
+            assert sigma is not None and sigma_next is not None, "State head requires both sigma (t) and sigma_next (r)."
+            c_skip = torch.ones_like(sigma) # [b, ...]
+            c_out = noise_labels_next.clone() # [b, ...] == (t - r)
+            interval_is_positive = torch.all(noise_labels_next > 0)
+            assert interval_is_positive, "State parameterization requires t > r (strictly positive interval)."
+
         if x_noised is not None:
             assert len(x_noised) == len(sigma), f'x_noised.shape={x_noised.shape}, sigma.shape={sigma.shape}. Batch sizes should match.'
             x_noised = x_noised.to(torch.float32) # [b, ...]
@@ -217,14 +229,18 @@ class Diffusion(BaseNetwork):
 
         return x_input, noise_labels, noise_labels_next, c_skip, c_out, force_dtype
 
-    def _forward(self, x_noised, sigma=None, cond=None, sigma_next=None, force_fp32=False, return_extra_output: bool=False, **model_kwargs) -> tuple[torch.Tensor, Any]:
+    def _forward(self, x_noised, sigma=None, cond=None, sigma_next=None, force_fp32=False, return_extra_output: bool=False, head: str='velocity', **model_kwargs) -> tuple[torch.Tensor, Any]:
         # Compute input and output.
         sigma = torch.ones(len(x_noised), device=x_noised.device).fill_(self.cfg.sampling.get('sigma_min', 0.0) + 1e-16) if sigma is None and x_noised is not None else sigma # [b] or None
         sigma = sigma.to(torch.float32) if sigma is not None else None # [b, ...] or None
         sigma = sigma.reshape(len(sigma), 1, 1, 1, 1) if sigma is not None and sigma.ndim == 1 else sigma # [b, ...]
         sigma_next = sigma_next.to(torch.float32).reshape(len(sigma_next), 1, 1, 1, 1) if sigma_next is not None else None # [b, 1, 1, 1, 1] or None
-        x_input, noise_labels, noise_labels_next, c_skip, c_out, force_dtype = self._construct_input(x_noised, sigma, sigma_next, force_fp32) # [b, l, c, h, w], [b, ...], [b, ...], [b, ...], [b, ...], torch.dtype or None
+        x_input, noise_labels, noise_labels_next, c_skip, c_out, force_dtype = self._construct_input(x_noised, sigma, sigma_next, force_fp32, head=head) # [b, l, c, h, w], [b, ...], [b, ...], [b, ...], [b, ...], torch.dtype or None
         model_kwargs.update({"noise_labels_next": noise_labels_next} if noise_labels_next is not None else {})
+        if head != 'velocity':
+            assert getattr(self.model, 'parameterization', 'velocity') == 'state', \
+                f"Requested head='{head}' but backbone parameterization is '{getattr(self.model, 'parameterization', 'velocity')}'."
+            model_kwargs.update({"head": head})
         output, extra_output = self.model(x_input, noise_labels=noise_labels, cond=cond, **model_kwargs)
 
         # Post-process the output.

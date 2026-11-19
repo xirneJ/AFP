@@ -11,6 +11,15 @@ use_captions_conditioning_when_available: true
 compile_blocks: false
 self_cond_probability: 0.9
 
+# Output parameterization of the backbone (used by the alphaflow preconditioning):
+#   velocity -> official model: the network predicts the interval-average velocity u(z_t, r, t);
+#   state    -> the network additionally predicts the endpoint state
+#               f(z_t, r, t) = z_t - (t-r) * u(z_t, r, t) with a second output head.
+# For `state`, the r == t (flow-matching) samples keep using the velocity head, so `ratio_fm > 0`
+# is required for the velocity head to stay trained (all official alphaflow/meanflow presets satisfy it).
+parameterization: velocity
+state_head_init: negate_velocity # Initialise the state head as -velocity head (strict reparameterization at step 0).
+
 # Dimension of the input
 # input_size: [3, 36, 64]
 # The size of the input patch [frames, height, width]

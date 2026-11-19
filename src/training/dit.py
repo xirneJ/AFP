@@ -63,21 +63,31 @@ class FinalLayer(nn.Module):
         modulate: bool=True,
         norm_type: bool='layer_norm',
         enable_layernorm_kernel=False,
+        dual_head: bool=False,
         **block_kwargs
     ):
         super().__init__()
         norm_kwargs = {'layer_norm': dict(eps=1e-6, use_kernel=enable_layernorm_kernel)}[norm_type]
         self.norm_final = construct_norm_layer(norm_type, hidden_size, affine=not modulate, eps=1e-6, use_kernel=enable_layernorm_kernel)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        # Optional second head used by the "state" parameterization (see model.parameterization).
+        # It shares the adaLN modulation and the final norm with the velocity head and only adds
+        # one extra linear projection.
+        self.linear_state = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True) if dual_head else None
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, head: str='velocity'):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final, x, shift, scale)
-        x = self.linear(x)
+        if head == 'state':
+            assert self.linear_state is not None, "State head requested but the model was built without `parameterization: state`."
+            x = self.linear_state(x)
+        else:
+            assert head == 'velocity', f"Unknown head: {head}"
+            x = self.linear(x)
 
         return x
 
@@ -120,7 +130,13 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(self.cfg.dim, self.num_heads, mlp_ratio=self.cfg.mlp_ratio, qk_norm=False) for _ in range(self.cfg.num_blocks)
         ])
-        self.final_layer = FinalLayer(self.cfg.dim, self.patch_size, self.out_channels)
+        # Output parameterization:
+        #   velocity -> a single head outputting the interval-average velocity u (official model);
+        #   state    -> an additional head outputting the negated velocity, so that with
+        #               c_skip=1, c_out=(t-r) the wrapper returns f = z_t-(t-r)u directly.
+        self.parameterization = str(cfg.get('parameterization', 'velocity'))
+        assert self.parameterization in ('velocity', 'state'), f'Unknown parameterization: {self.parameterization}'
+        self.final_layer = FinalLayer(self.cfg.dim, self.patch_size, self.out_channels, dual_head=(self.parameterization == 'state'))
         self.initialize_weights()
 
     def _build_posenc(self):
@@ -148,6 +164,8 @@ class SiT(nn.Module):
 
         zero_init(self.final_layer.adaLN_modulation[-1])
         zero_init(self.final_layer.linear)
+        if self.final_layer.linear_state is not None:
+            zero_init(self.final_layer.linear_state)
 
     def unpatchify(self, x, patch_size=None):
         """
@@ -173,6 +191,7 @@ class SiT(nn.Module):
             sc_latents: Optional[torch.Tensor]=None,
             augment_labels: Optional[torch.Tensor]=None,
             force_label_dropout: bool=False,
+            head: str='velocity',
         ):
         _, _, _ = return_logvar, augment_labels, sc_latents # Unused in this implementation
         x = misc.rearrange(x, 'b t c h w -> (b t) c h w') # Merge temporal dimension into height
@@ -200,7 +219,7 @@ class SiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
+        x = self.final_layer(x, c, head=head)  # (N, T, patch_size ** 2 * out_channels)
         data_tokens_before_detok = x
         x = misc.rearrange(x, 'b (t p) d -> (b t) p d', t=self.num_frames)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
