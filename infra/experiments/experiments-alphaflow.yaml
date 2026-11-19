@@ -163,3 +163,190 @@ alphaflow-sigmoid-latentspace-XL-2-cfg-training:
   _inherit_: alphaflow-latentspace-XL-2-cfg-training
   overrides:
     loss: {ratio_fm: {scheduler: constant, initial_value: 0.5}, alpha: {scheduler: sigmoid, initial_value: 1.0, end_value: 0, change_init_steps: 600000, change_end_steps: 1000000, clamp_value: 0.005, gamma: 25.0}, clamp_utgt: 4.0}
+
+# ===========================================================================
+# Single-GPU presets (RTX 5090 / 32 GiB, plain `venv`, no torchrun).
+#
+# Differences from the multi-GPU presets above:
+#   * 1 GPU, `direct_launch=true` -> launched with `python`, not `torchrun`;
+#   * `dp.strategy: null`          -> no DDP/FSDP wrapper on a single device;
+#   * VAE latents are computed on the fly (no dataset-wide latent pre-extraction);
+#   * W&B and heavy in-training metrics are disabled/reduced.
+#
+# Launch with:
+#   bash scripts/train_single_gpu.sh <experiment-name>
+#
+# All values can still be overridden on the command line, e.g.:
+#   bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
+#        dataset.batch_gpu=16 dataset.batch_size=128 training.max_steps=50000
+# ===========================================================================
+
+# Offline smoke test of the training loop: pixel-space SiT, synthetic 64x64
+# images, no VAE / no HuggingFace downloads required.
+#   python scripts/make_dummy_dataset.py
+#   bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu
+alphaflow-smoke-test-single-gpu:
+  model: dit_alphaflow
+  loss: alphaflow
+  dataset: dummy
+  sampling: recflow
+  env: local
+  pre_extract_latents: none
+  overrides:
+    num_gpus: 1
+    direct_launch: true
+    max_restarts: 0
+    quiet_launch: true
+    wandb: {enabled: false}
+    training:
+      max_steps: 30
+      metrics: []
+      metrics_rare: []
+      metrics_final: []
+      metrics_extra_sampling_cfg_overwrites: {}
+      num_vis_samples: 2
+      log_loss_across_gpus: false
+      dp: {strategy: null}
+      freqs:
+        snapshot: null
+        snapshot_latest: null
+        save_samples: null
+        loss_train_commit: 10
+        loss_per_sigma: null
+        loss_val: null
+        metrics: null
+        metrics_rare: null
+        param_stats: null
+        ctrl_check: 10
+    sampling:
+      num_steps: 2
+      sigma_noise: 1.0
+      enable_trajectory_sampling: false
+      enable_consistency_sampling: false
+    dataset:
+      resolution: [1, 64, 64]
+      batch_gpu: 8
+      batch_size: 8
+      num_workers: 2
+      test_batch_gpu: 2
+      gen_batch_gpu: 1
+    model:
+      num_blocks: 6
+      dim: 256
+      num_heads: 4
+      checkpointing: true
+      ema_halflife_steps: 50
+      ema_rampup_ratio: ~
+
+# Offline smoke test of the latent-space (LDM + SD-VAE) path.
+# Requires snapshots/sd_vae_ft_ema.pt and the ability to instantiate
+# `stabilityai/sd-vae-ft-ema` through diffusers (network or HF cache).
+alphaflow-smoke-test-ldm-single-gpu:
+  model: dit_alphaflow_ldm
+  loss: alphaflow
+  dataset: dummy
+  sampling: recflow
+  env: local
+  pre_extract_latents: none
+  overrides:
+    num_gpus: 1
+    direct_launch: true
+    max_restarts: 0
+    quiet_launch: true
+    wandb: {enabled: false}
+    training:
+      max_steps: 20
+      metrics: []
+      metrics_rare: []
+      metrics_final: []
+      metrics_extra_sampling_cfg_overwrites: {}
+      num_vis_samples: 2
+      log_loss_across_gpus: false
+      dp: {strategy: null}
+      freqs:
+        snapshot: null
+        snapshot_latest: null
+        save_samples: null
+        loss_train_commit: 5
+        loss_per_sigma: null
+        loss_val: null
+        metrics: null
+        metrics_rare: null
+        param_stats: null
+        ctrl_check: 10
+    sampling:
+      num_steps: 2
+      sigma_noise: 1.0
+      enable_trajectory_sampling: false
+      enable_consistency_sampling: false
+    dataset:
+      resolution: [1, 128, 128]
+      batch_gpu: 4
+      batch_size: 4
+      num_workers: 2
+      test_batch_gpu: 2
+      gen_batch_gpu: 1
+    model:
+      num_blocks: 2
+      dim: 128
+      num_heads: 2
+      checkpointing: true
+      ema_halflife_steps: 20
+      ema_rampup_ratio: ~
+      num_samples_to_estimate_stats: 32
+      optim: {class_name: torch.optim.Adam, betas: [0.9, 0.95], weight_decay: 0.0, lr: 0.0001}
+      lr_scheduler: {final_lr: 0.0001}
+      autoencoder_ckpt:
+        snapshot_path: ${env.project_path}/snapshots/sd_vae_ft_ema.pt
+        convert_params_to_buffers: false
+
+# Base latent-space B/2 model on a single GPU (ImageNet-1K, 256x256).
+# This is the parent preset for the FM / MeanFlow / alpha-Flow comparison runs.
+alphaflow-latentspace-B-2-single-gpu:
+  _inherit_: alphaflow-256x256-b256-ditb2-sdvae-base-folder
+  overrides:
+    num_gpus: 1
+    direct_launch: true
+    max_restarts: 0
+    quiet_launch: true
+    wandb: {enabled: false}
+    loss: {cfg_params: {omega: 1.0, t_min: 0.0, t_max: 1.0, kappa: 0.0}}
+    training:
+      max_steps: 400000
+      metrics: [fid2048_full]
+      metrics_rare: []
+      metrics_final: []
+      metrics_extra_sampling_cfg_overwrites:
+        ~NFE_2_consistency_sampling: ~ # kept only for the multi-GPU preset
+      num_vis_samples: 8
+      traj_len_for_vis_gen: 1
+      log_loss_across_gpus: false
+      dp: {strategy: null}
+      freqs: {snapshot: 100000, snapshot_latest: 2000, save_samples: 10000, loss_train_commit: 10, loss_per_sigma: null, loss_val: null, metrics: 25000, metrics_rare: null, param_stats: null, ctrl_check: 10}
+    sampling:
+      num_steps: 1
+      sigma_noise: 1.0
+      enable_trajectory_sampling: true
+      enable_consistency_sampling: false
+    dataset:
+      batch_gpu: 32
+      batch_size: 256
+      num_workers: 8
+      test_batch_gpu: 4
+      gen_batch_gpu: 2
+      metrics_detector_batch_gpu: 16
+    model:
+      checkpointing: true
+      ema_halflife_steps: 6931
+
+# MeanFlow baseline on a single GPU.
+alphaflow-meanflow-latentspace-B-2-single-gpu:
+  _inherit_: alphaflow-latentspace-B-2-single-gpu
+  overrides:
+    loss: {alpha: {scheduler: constant, initial_value: 0.0}, ratio_fm: {scheduler: constant, initial_value: 0.5}, clamp_utgt: 4.0}
+
+# alpha-Flow (sigmoid alpha schedule) on a single GPU -- the proposed method.
+alphaflow-sigmoid-latentspace-B-2-single-gpu:
+  _inherit_: alphaflow-latentspace-B-2-single-gpu
+  overrides:
+    loss: {alpha: {scheduler: sigmoid, initial_value: 1.0, end_value: 0, change_init_steps: 0, change_end_steps: 400000, clamp_value: 0.005, gamma: 25.0}, ratio_fm: {scheduler: constant, initial_value: 0.5}}

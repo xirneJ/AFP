@@ -9,6 +9,13 @@ from contextlib import nullcontext
 from datetime import datetime
 from collections import defaultdict
 
+# Make `import src...` work no matter how this script is launched.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Used by configs/env/user.yaml to locate data/snapshots/output (cross-platform).
+os.environ.setdefault('ALPHAFLOW_PROJECT_PATH', _REPO_ROOT)
+
 import wandb
 import hydra
 import torch
@@ -208,7 +215,9 @@ def train(cfg: DictConfig):
             should_increment_tick_due_to_steps = cfg.training.steps_per_tick is not None and (stats.cur_step >= tick_stats.start_step + cfg.training.steps_per_tick)
             should_continue_tick = (not stats.done) and (stats.cur_tick != 0) and not should_increment_tick_due_to_time and not should_increment_tick_due_to_steps and not ctrl_state.should_do_something
             should_continue_tick = torch.tensor(should_continue_tick, dtype=torch.bool).to(device) # [1]
-            if torch.distributed.is_initialized():
+            # Only synchronize when there actually are multiple processes. Skipping this
+            # for a single process also keeps Windows (gloo backend, no NCCL) happy.
+            if dist.get_world_size() > 1:
                 torch.distributed.broadcast(should_continue_tick, src=0) # [1]
             should_continue_tick = should_continue_tick.item()
 
@@ -579,6 +588,8 @@ def compute_and_log_autoencoder_stats(nets: Nets, data: Data, cfg, device, stats
 def init_random_seed(cfg: EasyDict) -> int:
     if cfg.training.seed is not None:
         return cfg.training.seed
+    elif dist.get_world_size() <= 1:
+        return int(torch.randint(1 << 31, size=[], device=torch.device('cuda')))
     else:
         seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
         torch.distributed.broadcast(seed, src=0)

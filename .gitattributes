@@ -1,0 +1,8 @@
+# Normalize line endings so that shell scripts and configs work when the repo is
+# checked out on Linux from a Windows machine (and vice versa).
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

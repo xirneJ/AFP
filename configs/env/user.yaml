@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# User-specific settings (single GPU / plain `venv`, Linux or Windows).
+#
+# This file is loaded automatically by configs/env/base.yaml.
+#
+# `project_path` is taken from the ALPHAFLOW_PROJECT_PATH environment variable.
+# All entrypoints (infra/launch.py, scripts/generate.py, scripts/evaluate.py,
+# scripts/*_single_gpu.sh|.ps1) set it to the repository root automatically, so
+# for a normal checkout you do not need to touch anything here.
+#
+# To keep datasets/checkpoints/outputs on another disk, export it explicitly:
+#   Linux:   export ALPHAFLOW_PROJECT_PATH=/data/alphaflow
+#   Windows: $env:ALPHAFLOW_PROJECT_PATH = "D:\alphaflow"
+# (then data/ snapshots/ output/ are looked up relative to that directory;
+#  either symlink this repo's folders there or copy them.)
+#
+# This file is NOT supposed to contain secrets; WANDB credentials are read
+# from the environment variables set below (leave them empty to disable).
+# ---------------------------------------------------------------------------
+user: xyds25
+
+# Root of the AlphaFlow project (datasets/ snapshots/ output/ live under it).
+project_path: ${oc.env:ALPHAFLOW_PROJECT_PATH}
+
+# Where datasets live.  ImageNet-1K is expected at:
+#   ${env.folder_datasets_path}/imagenet/{train,val}
+folder_datasets_path: ${env.project_path}/data
+cache_dir: ${env.project_path}/.cache
+dataset_stats_dir: ${env.project_path}/data/stats
+latents_stats_dir: ${env.project_path}/data/latents-stats
+
+# A path to the installed Python environment directory.
+# With a plain venv this is `${project_path}/venv` (Linux) or
+# `${project_path}/venv` (Windows, still storing it under the repo root).
+conda_env_dirname: venv
+
+# Unused when launching with `direct_launch=true` (our single-GPU entrypoints),
+# but Hydra still needs a value.
+conda_init_bin_path: ~
+
+# WANDB is disabled in the single-GPU experiment presets.  Fill these in only
+# if you want to log to Weights & Biases.
+wandb_parent_dir: ~
+wandb_env_args:
+  WANDB_API_KEY: ~
+  WANDB_USERNAME: ~
+  WANDB_BASE_URL: ~
+  WANDB_ENTITY: ~
+  WANDB_API_KEY_SPOOKEY_KEYNAME: ~
+  WANDB_USER_EMAIL: ~
+  WANDB_SILENT: true
+
+# Optional experiment-id range for sharing a cluster with other people.
+max_experiment_id: ~

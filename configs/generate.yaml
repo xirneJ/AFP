@@ -19,6 +19,8 @@ save_traj_step_idx: ~ # Should we save the trajectory for some particular step i
 use_val_videos: true # Should we use validation videos for sampling?
 allow_tf32: true
 cudnn_benchmark: false # Sometimes, the first iteration with benchmarking is too slow or OOM with this flag.
+inference_dtype: ~ # Low-VRAM option: cast DiT backbone to 'bfloat16'/'float16' (keep VAE in fp32).
+empty_cache_each_batch: false # Release cached GPU memory after every generated batch (helps with shared GPUs).
 overwrite_fps: ~ # If not null, then use the provided FPS for conditional generation.
 overwrite_dataset_id: ~ # If not null, then use the provided dataset_id for conditional generation.
 overwrite_video_flag: ~ # If not null, then use the provided video_flag for conditional generation.

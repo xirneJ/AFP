@@ -102,6 +102,9 @@ def dict_to_hydra_overrides(d, parent_key='') -> list[str]:
         new_key = f"{k[0] if k.startswith(HYDRA_SPECIAL_CHARS) else ''}{parent_key}.{k.lstrip(''.join(HYDRA_SPECIAL_CHARS))}" if parent_key else k
         if isinstance(v, dict):
             overrides.extend(dict_to_hydra_overrides(v, new_key))
+        elif v is None and new_key.startswith('~'):
+            # Hydra deletion syntax is `~key` (no value), not `~key=null`.
+            overrides.append(new_key)
         else:
             overrides.append(f"{new_key}={maybe_none_to_null(v)}")
     return overrides
@@ -244,6 +247,10 @@ def get_next_experiment_id_str(experiments_dir: os.PathLike, **kwargs) -> str:
 
 
 def get_next_experiment_id(experiments_dir: os.PathLike, max_allowed_id: int | None=None) -> int:
+    # `experiments/` may not exist yet, e.g. on the first single-GPU launch
+    # with `direct_launch=true` (which never creates experiment dirs).
+    if not os.path.isdir(experiments_dir):
+        return 1
     cur_experiments = listdir_full_paths(experiments_dir)
     cur_experiments = [e for e in cur_experiments if os.path.isdir(e) and len(os.path.basename(e)) >= 4 and os.path.basename(e).split('-')[0].isdigit()]
     experiment_ids = [int(os.path.basename(e).split('-')[0]) for e in cur_experiments]

@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments (only at the repository root)
+/venv/
+/.venv/
+/env/
+/.env
+
+# ---------------------------------------------------------------------------
+# Large / machine-specific runtime artifacts (only at the repository root,
+# so source packages such as src/data/ are NOT ignored).
+# NEVER commit these: datasets, checkpoints, latents, generated samples.
+# ---------------------------------------------------------------------------
+/data/
+/snapshots/
+/experiments/
+/output/
+/wandb/
+/.cache/
+/tmp/
+/logs/
+
+# Model / dataset binaries (anywhere)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.pkl
+*.npz
+*.npy
+
+# Generated media
+*.mp4
+*.avi
+*.webm
+*.mov
+
+# Logs
+*.log
+
+# Temporary pip build directories
+/.pip_tmp/

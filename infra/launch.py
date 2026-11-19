@@ -4,9 +4,19 @@ From a brief experiment description, generates a full experiment config, the tra
 """
 # import sys; sys.path.extend(['..', '.', 'src'])
 import os
+import sys
 import socket
 import argparse
 from typing import Callable
+
+# Make `import src...` / `import infra...` work no matter how this script is launched
+# (e.g. `python infra/launch.py ...` puts `infra/` on sys.path, not the repo root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Used by configs/env/user.yaml to locate data/snapshots/output (cross-platform:
+# Windows has no $HOME by default). Wrappers may override it explicitly.
+os.environ.setdefault('ALPHAFLOW_PROJECT_PATH', _REPO_ROOT)
 
 from termcolor import colored
 from hydra import compose, initialize
@@ -78,8 +88,13 @@ def launch(cfg: DictConfig):
                 print(f'Saved config in {cfg.cfg_save_path}')
 
     if cfg.direct_launch:
-        cfg.experiment_dir = cfg.env.project_path
-        os.makedirs(os.path.join(cfg.experiment_dir, 'output'), exist_ok=True)
+        # In direct-launch mode there is no `experiments/<id>-...` directory.
+        # Give every experiment its own output directory so that different runs
+        # do not accidentally try to resume from each other's checkpoints:
+        #   <project_path>/output/<desc>/
+        cfg.experiment_dir = os.path.join(cfg.env.project_path, 'output', str(cfg.desc))
+        os.makedirs(cfg.experiment_dir, exist_ok=True)
+        cfg.output_dir = cfg.experiment_dir
 
     if not cfg.quiet_launch:
         print('<=== TRAINING COMMAND START ===>')

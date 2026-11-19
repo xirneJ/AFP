@@ -101,7 +101,11 @@ def barrier(*args, **kwargs) -> Any:
 def sync_barrier() -> None:
     # Synchronizes all processes by sharing a dummy tensor.
     # A normal barrier would fail to do so since some processes might be stuck in the previous one.
-    dummy = torch.tensor([0], device=torch.device('cuda'))
+    if not torch.distributed.is_initialized() or get_world_size() <= 1:
+        return
+    # Gloo (used on Windows, where NCCL does not exist) cannot reduce CUDA tensors.
+    device = torch.device('cpu') if torch.distributed.get_backend() == 'gloo' else torch.device('cuda')
+    dummy = torch.tensor([0], device=device)
     torch.distributed.all_reduce(dummy, op=torch.distributed.ReduceOp.SUM)
 
 def destroy_process_group():
@@ -131,6 +135,8 @@ def maybe_sync_state(net: torch.nn.Module):
         safe_broadcast(tensor)
 
 def safe_broadcast(tensor: torch.Tensor):
+    if not torch.distributed.is_initialized() or get_world_size() <= 1:
+        return
     if torch.distributed.get_backend() == torch.distributed.Backend.NCCL:
         # NCCL backend requires tensors to be on GPU
         if tensor.device.type != 'cuda':
@@ -147,13 +153,19 @@ def safe_broadcast(tensor: torch.Tensor):
 # Aggregation utils.
 
 def mean_across_gpus(x: torch.Tensor) -> torch.Tensor:
+    # On a single process there is nothing to reduce. Returning early also avoids
+    # gloo+NCCL backend/device mismatches (Windows has no NCCL, gloo rejects CUDA tensors).
+    if get_world_size() <= 1:
+        return x
     assert str(x.device) != 'cpu', f"Cannot reduce tensor on CPU: {x.device}"
     torch.distributed.reduce(x, dst=0, op=torch.distributed.ReduceOp.SUM)
     return x / get_world_size()
 
 def gather_across_gpus(x: torch.Tensor, group=None) -> torch.Tensor:
-    assert str(x.device) != 'cpu', f"Cannot gather tensor on CPU: {x.device}"
     world_size = get_world_size() if group is None else group.size()
+    if world_size <= 1:
+        return x.unsqueeze(0)
+    assert str(x.device) != 'cpu', f"Cannot gather tensor on CPU: {x.device}"
     x_out = torch.empty_like(x).unsqueeze(0).repeat_interleave(world_size, dim=0) # [world_size, *x_shape]
     torch.distributed.all_gather_into_tensor(x_out, x)
     return x_out
@@ -172,6 +184,17 @@ def gather_seeded_results(x: torch.Tensor, seeds: torch.Tensor, group=None, shou
         return {k: gather_seeded_results(x[k], seeds, group=group, should_sort=should_sort, drop_duplicates=drop_duplicates, cpu_offload_dims=cpu_offload_dims) for k in keys}
     assert len(x) == len(seeds), f"Wrong shapes: {x.shape}, {seeds.shape}"
     world_size = get_world_size() if group is None else group.size()
+
+    if world_size <= 1:
+        # Single process: replicate the multi-GPU post-processing without collectives.
+        if drop_duplicates:
+            assert should_sort, "Dropping duplicates requires sorting seeds"
+            _, idx_unique = np.unique(seeds.cpu().numpy(), return_index=True)
+            return x[idx_unique]
+        if should_sort:
+            _, indices = torch.sort(seeds, dim=0)
+            return x[indices]
+        return x
 
     # Gathering seeds
     seeds_out = torch.empty_like(seeds).unsqueeze(0).repeat_interleave(world_size, dim=0) # [world_size, n, ...]
@@ -195,6 +218,8 @@ def gather_seeded_results(x: torch.Tensor, seeds: torch.Tensor, group=None, shou
 
 def all_gather_into_tensor_with_offload(x: torch.Tensor, group=None, cpu_offload_dims: list[int]=None) -> torch.Tensor:
     world_size = get_world_size() if group is None else group.size() # [1]
+    if world_size <= 1:
+        return x.unsqueeze(0)
     if cpu_offload_dims is not None and len(cpu_offload_dims) > 0:
         # Batch-wise gathering with CPU off-loading for the specified dimensions.
         x_out = []
@@ -248,6 +273,8 @@ class ControlSignal:
 
     def sync(self):
         """Broadcasts the control signal to all processes."""
+        if not torch.distributed.is_initialized() or get_world_size() <= 1:
+            return self
         signal = torch.tensor([self.should_stop, self.should_snapshot], dtype=torch.bool, device=torch.device('cuda'))
         torch.distributed.broadcast(signal, src=0)
         return ControlSignal(

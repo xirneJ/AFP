@@ -1,6 +1,14 @@
 import os
 import sys
 
+# Make `import src...` / `import infra...` work no matter how this script is launched
+# (e.g. `python scripts/generate.py ...` puts `scripts/` on sys.path, not the repo root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Used by configs/env/user.yaml to locate data/snapshots/output (cross-platform).
+os.environ.setdefault('ALPHAFLOW_PROJECT_PATH', _REPO_ROOT)
+
 import numpy as np
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -49,11 +57,25 @@ def generate(cfg: DictConfig):
 
     net, snapshot_path, experiment_cfg = load_snapshot(cfg.ckpt, verbose=cfg.verbose and dist.is_main_process(), device=device)
     net = net.eval().to(device)
+
+    # Optional low-VRAM mode: cast only the DiT backbone (not the VAE) to a smaller dtype.
+    # Weights of DiT-B/2 are ~0.5 GiB in fp32, so bf16 saves enough to make a
+    # single-image generation fit into a 2-3 GiB free-VRAM slice on a shared GPU.
+    if cfg.get('inference_dtype') is not None:
+        dtype = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16}[str(cfg.inference_dtype)]
+        backbone = getattr(net, 'model', None)
+        if backbone is not None:
+            backbone.to(dtype=dtype)
+        else:
+            net.to(dtype=dtype)
+        dist.loginfo0(f'Casting the DiT backbone to {cfg.inference_dtype} for low-VRAM inference.')
+    misc.free_memory()
+
     if 'sampling' not in cfg:
         cfg.sampling = experiment_cfg.sampling
     net.cfg.sampling = experiment_cfg.sampling
 
-    if 'dataset' in cfg:
+    if cfg.get('dataset') is not None:
         # Use batching/resolution from the original dataset, but everything else from the new one.
         cfg.dataset.resolution = experiment_cfg.dataset.resolution
         cfg.dataset.predownload = experiment_cfg.dataset.predownload
@@ -162,9 +184,16 @@ def generate(cfg: DictConfig):
         if not profiler is None:
             profiler.step()
 
+        # Helpful when sharing a GPU with other jobs: release cached blocks eagerly.
+        if cfg.get('empty_cache_each_batch', False):
+            misc.free_memory()
+
     # Done.
     if not profiler is None:
         profiler.stop()
+    if torch.cuda.is_available():
+        dist.loginfo0(f'Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB. '
+                      f'Reserved: {torch.cuda.max_memory_reserved(device) / 2**30:.2f} GiB.')
     dist.barrier()
     if cfg.verbose:
         dist.loginfo0('Done.')

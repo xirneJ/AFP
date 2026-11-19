@@ -17,11 +17,59 @@ conda activate ./env
 ```
 
 #### Step 2: Configure user settings
-Copy an example of user settings:
+This fork ships a ready-to-use `configs/env/user.yaml` for a single-GPU / `venv`
+setup. `project_path` is read from the `ALPHAFLOW_PROJECT_PATH` environment variable,
+which every entrypoint (`infra/launch.py`, `scripts/*.py`, `scripts/*_single_gpu.sh|.ps1`)
+sets to the repository root automatically — so normally you do not need to edit anything.
+For the original multi-GPU/conda setup you can instead start from the example:
 ```bash
 cp configs/env/user-example.yaml configs/env/user.yaml
 ```
-Now, edit `configs/env/user.yaml` to set the correct paths to the data, the environment and Wandb config (if required). You need to at least define `project_path` and `conda_init_bin_path` in this file.
+Then set the correct paths to the data, the environment and Wandb config (if required). You need to at least define `project_path` and `conda_init_bin_path` in this file.
+
+## Single-GPU quickstart (RTX 5090 / Blackwell, Linux)
+
+The official instructions above assume 8×H100 + conda. This fork also supports a
+**single consumer GPU (e.g. RTX 5090, sm_120) with a plain `venv`**, which is enough
+to run inference and to train the B/2 model for controlled comparison experiments.
+
+```bash
+# 1) Blackwell-compatible environment (torch cu128) + dependency check
+bash scripts/setup_env.sh
+source venv/bin/activate
+python scripts/check_setup.py          # reports GPU/CUDA/data/checkpoint status
+
+# 2) Single-image inference with the released alpha-Flow-B/2-cfg checkpoint
+#    (download the *.pt files into ./snapshots/ first)
+bash scripts/generate_single_gpu.sh
+
+# 3) Offline smoke test of the training loop (no ImageNet needed, ~1 min)
+python scripts/make_dummy_dataset.py
+bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu
+
+# 4) Real single-GPU training presets (FM / MeanFlow / alpha-Flow) on ImageNet-1K
+bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu
+```
+
+Full runbook (data preparation, VRAM/time estimates, evaluation, how to set up
+your own comparison experiments): **[docs/SINGLE_GPU.md](docs/SINGLE_GPU.md)**.
+
+### Windows (RTX 50-series laptop, PowerShell)
+
+The same single-GPU presets run natively on Windows (PyTorch cu128, gloo backend):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
+.\venv\Scripts\Activate.ps1
+python scripts\check_setup.py
+python scripts\make_dummy_dataset.py
+powershell -ExecutionPolicy Bypass -File scripts\train_single_gpu.ps1 alphaflow-smoke-test-single-gpu
+```
+
+See **[docs/SINGLE_GPU_WINDOWS.md](docs/SINGLE_GPU_WINDOWS.md)** for the Windows runbook
+(inference, data, 8-GiB VRAM limits, HF mirror, troubleshooting).
+
+
 
 ## Inference
 

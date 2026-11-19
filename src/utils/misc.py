@@ -492,13 +492,20 @@ def unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, torch.nn.parallel.DistributedDataParallel) else module
 
 @contextlib.contextmanager
-def summon_full_params(*args, **kwargs):
+def summon_full_params(module, *args, **kwargs):
     """
     A context manager proxy so that we do not need to have a scary FSDP import everywhere
-    (apparently, they seems to be including some bizarre torch.jit compilations)
+    (apparently, they seems to be including some bizarre torch.jit compilations).
+
+    On a single GPU (or with `dp.strategy=null/ddp`) the module is not an FSDP instance,
+    in which case we simply yield it unchanged. This makes the single-GPU snapshotting
+    code work instead of raising an FSDP-only error.
     """
-    with FSDP.summon_full_params(*args, **kwargs) as ctx:
-        yield ctx
+    if isinstance(module, FSDP):
+        with FSDP.summon_full_params(module, *args, **kwargs) as ctx:
+            yield ctx
+    else:
+        yield module
 
 def set_fsdp_wrap_recursively_(module: torch.nn.Module, should_fsdp_wrap: bool) -> None:
     # Set's the `should_fsdp_wrap` flag for all modules in the hierarchy.
@@ -511,6 +518,10 @@ def set_fsdp_wrap_recursively_(module: torch.nn.Module, should_fsdp_wrap: bool) 
 
 def check_ddp_consistency(model, ignore_regex=None, prefix: str='', atol: float=0.0, rtol: float=0.0):
     assert isinstance(model, torch.nn.Module), f"Unsupported type: {type(model)}"
+    # With a single process there is nothing to compare against, and the model
+    # is typically not FSDP-wrapped (single-GPU training uses dp.strategy=null).
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() <= 1:
+        return
     with summon_full_params(model):
         for name, tensor in named_params_and_buffers(model):
             fullname = type(model).__name__ + '.' + name

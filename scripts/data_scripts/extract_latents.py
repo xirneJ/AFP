@@ -2,8 +2,16 @@ import os
 import math
 import json
 import pickle
+import sys
 import traceback
 import shutil
+
+# Make `import src...` / `import infra...` work no matter how this script is launched.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Used by configs/env/user.yaml to locate data/snapshots/output (cross-platform).
+os.environ.setdefault('ALPHAFLOW_PROJECT_PATH', _REPO_ROOT)
 
 import torch
 from omegaconf import DictConfig

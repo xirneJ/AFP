@@ -1,0 +1,14 @@
+defaults:
+  - base.yaml
+  - _self_
+
+# Synthetic dataset created by scripts/make_dummy_dataset.py.
+# Only used by the offline single-GPU smoke tests.
+name: dummy
+data_type: image
+label_shape: [8]
+src: ${env.folder_datasets_path}/dummy/train/
+src_val: ${env.folder_datasets_path}/dummy/val/
+local_dir: ~ # local files are already on this machine -> do not copy them through the cache
+metadata_ext: .meta.json
+replace_broken_samples_with_random: false

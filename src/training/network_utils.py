@@ -398,6 +398,46 @@ def infer_snapshot_path(snapshot_cfg: SnapshotConfig, verbose: bool=True) -> os.
     return snapshot_path
 
 
+def _relocate_loaded_cfg_paths(experiment_cfg, repo_root: str) -> None:
+    """Fix machine-specific absolute paths stored inside a checkpoint config.
+
+    Released checkpoints embed the paths of the machine they were trained on
+    (e.g. ``/nfs/.../snapshots/sd_vae_ft_ema.pt``).  When the checkpoint is
+    moved to a different machine we rewrite the fields required for inference
+    so that they point into the current checkout wherever possible
+    (``./snapshots/<basename>``).  Missing directories are never created and
+    valid paths are left untouched, so this is safe to call unconditionally.
+    """
+    repo_root = os.path.abspath(repo_root)
+
+    def _is_dir(p) -> bool:
+        p = None if p is None else os.path.expanduser(str(p))
+        return p is not None and os.path.isdir(p)
+
+    def _is_file(p) -> bool:
+        p = None if p is None else os.path.expanduser(str(p))
+        return p is not None and os.path.isfile(p)
+
+    env = experiment_cfg.get('env') if isinstance(experiment_cfg, dict) else None
+    if env is not None and not _is_dir(env.get('project_path')):
+        env.project_path = repo_root
+
+    model = experiment_cfg.get('model') if isinstance(experiment_cfg, dict) else None
+    autoencoder_ckpt = model.get('autoencoder_ckpt') if model is not None else None
+    if autoencoder_ckpt is not None:
+        path = autoencoder_ckpt.get('snapshot_path')
+        if path is not None and not _is_file(path):
+            relocating_candidates = [
+                os.path.join(repo_root, 'snapshots', os.path.basename(str(path))),
+                os.path.join(repo_root, os.path.basename(str(path))),
+            ]
+            for candidate in relocating_candidates:
+                if _is_file(candidate):
+                    dist.loginfo0(f'Relocating the autoencoder checkpoint: {path} -> {candidate}')
+                    autoencoder_ckpt.snapshot_path = candidate
+                    break
+
+
 def load_snapshot(snapshot_cfg: DictConfig, verbose: bool=True, device='cpu'):
     snapshot_cfg = SnapshotConfig(**snapshot_cfg) if not isinstance(snapshot_cfg, SnapshotConfig) else snapshot_cfg
     snapshot_path = infer_snapshot_path(snapshot_cfg, verbose=verbose)
@@ -422,6 +462,8 @@ def load_snapshot(snapshot_cfg: DictConfig, verbose: bool=True, device='cpu'):
         experiment_cfg = experiment_cfg.to_dict() if isinstance(experiment_cfg, EasyDict) else experiment_cfg # TODO: remove this legacy; make sure that the config is always a dict...
         experiment_cfg = OmegaConf.merge(experiment_cfg, EasyDict.init_recursively(snapshot_cfg.cfg_overwrites).to_dict())
     experiment_cfg = config_utils.legacy_patch_experiment_cfg(EasyDict.init_recursively(experiment_cfg))
+    # Checkpoints may have been trained on a different machine; fix stale paths.
+    _relocate_loaded_cfg_paths(experiment_cfg, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     net = instantiate_network_from_cfg(experiment_cfg).to(device=device, dtype=DTYPE_STRING_TO_DTYPE[experiment_cfg.model.param_dtype])
     if snapshot_cfg.convert_params_to_buffers:
         misc.replace_parameters_with_buffers_(net)
