@@ -1,5 +1,7 @@
 name: ~
+data_type: image # One of [image, video, image_latent, video_latent]. Overridden per dataset.
 has_captions: false
+s3_listdir_cache_dir: ~ # Only used for S3 sources; kept here so every dataset config has the field.
 label_shape: []
 framerate: 12.0 # Valid only for video datasets.
 frame_seek_timeout_sec: 5.0 # Number of seconds to wait for a frame to be decoded.
