@@ -69,6 +69,10 @@ def train(cfg: DictConfig):
     nets_to_log = nets if cfg.wandb.log_ema_stats else Nets(net=nets.net, ema=None)
     net_named_parameters = ema_named_parameters = None # dict cache for the model.
     teacher_named_parameters = teacher_ema_named_parameters = None # dict cache for the EMA target teacher (A2 only).
+    # Diagnostics for the EMA clocks (recorded in the tick log; they do not affect the training math).
+    eval_ema_beta_last = 0.0
+    teacher_ema_beta_last = 0.0
+    teacher_ema_updates = 0
 
     # Note: we need to print the model info before computing the stats since it inits FSDP.
     logging_utils.print_model_info(cfg, data.batch_info.batch_gpu, nets, device)
@@ -198,15 +202,21 @@ def train(cfg: DictConfig):
             logging_utils.maybe_log_losses_and_grads(cfg, stats, loss_means, net_grad_log_dict, grad_norm_log_dict, commit=should_wandb_commit)
 
         # Maybe update the EMA.
-        ema_beta, net_named_parameters, ema_named_parameters = update_ema(cfg, nets.net, nets.ema, stats, net_named_parameters, ema_named_parameters) if should_update_ema and cfg.model.use_ema else (1.0, None, None)
+        if should_update_ema and cfg.model.use_ema:
+            ema_beta, net_named_parameters, ema_named_parameters = update_ema(cfg, nets.net, nets.ema, stats, net_named_parameters, ema_named_parameters)
+            eval_ema_beta_last = float(ema_beta)
+        else:
+            ema_beta = 1.0
 
         # Maybe update the EMA target teacher (stage 2 / A2). This is a *separate* module from the
         # evaluation EMA above: it is only used by the loss target branch. Update order is identical
         # to the evaluation EMA: after optimizer.step() + grad clip, every `ema_update_freq` optimizer
         # steps, with the same decay/rampup formula (t = stats.cur_step = optimizer step count).
         if should_update_ema and getattr(loss_fn, 'teacher', None) is not None:
-            _, teacher_named_parameters, teacher_ema_named_parameters = update_ema(
+            teacher_beta, teacher_named_parameters, teacher_ema_named_parameters = update_ema(
                 cfg, nets.net, loss_fn.teacher, stats, teacher_named_parameters, teacher_ema_named_parameters)
+            teacher_ema_beta_last = float(teacher_beta)
+            teacher_ema_updates += 1
 
         with torch.profiler.record_function('stats_log_and_update'):
             # Let's save some stats
@@ -248,8 +258,18 @@ def train(cfg: DictConfig):
             for stats_dict in (net_grad_log_dict, grad_norm_log_dict):
                 extra_stats.update({k.replace('Grad/', 'grad_'): float(v) for k, v in stats_dict.items()})
             if getattr(loss_fn, 'teacher', None) is not None:
-                # Diagnostic: is the EMA target teacher actually moving away from the student?
+                # Diagnostics: is the EMA target teacher actually moving, with which beta, and how many
+                # updates have happened so far (t = optimizer step; identical clock to the eval EMA)?
                 extra_stats['teacher_student_rel_dist'] = network_utils.teacher_student_distance_(loss_fn.teacher, nets.net)
+                extra_stats['teacher_ema_beta'] = teacher_ema_beta_last
+                extra_stats['teacher_ema_updates'] = teacher_ema_updates
+            if cfg.model.use_ema:
+                extra_stats['eval_ema_beta'] = eval_ema_beta_last
+            grad_clip_cfg = cfg.model.get('grad_clip') if hasattr(cfg.model, 'get') else None
+            if grad_clip_cfg is not None and grad_clip_cfg.get('norm') is not None:
+                # grad_norm in the same line is the pre-clipping norm; clipping is active iff
+                # grad_norm > grad_clip_norm.
+                extra_stats['grad_clip_norm'] = float(grad_clip_cfg.norm)
             logging_utils.print_tick_stats0(stats, tick_stats, loss_means['total'].mean(), device, maintenance_time, extra_stats=extra_stats)
             if cfg.wandb.enabled:
                 sec_per_nimg = (tick_stats.end_time - tick_stats.start_time) / (stats.cur_nimg - tick_stats.start_nimg + 1e-16)
