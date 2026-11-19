@@ -19,14 +19,49 @@ python scripts/check_setup.py
 | 检查项 | 说明 |
 |---|---|
 | PyTorch / CUDA | 5090 是 sm_120，**必须** CUDA 12.8+ 的 torch，否则会报 `no kernel image is available` 或静默回退 CPU |
-| 当前空闲显存 | 现在别人的 4 个任务占了 ~30/32 GiB，脚本会给出“能推理 / 能训练 / 都不能”的结论 |
+| 当前空闲显存 | 脚本会按当前 free VRAM 给出“只能推理 / 可以训练”的结论（单卡 B/2 训练通常需要 ≥10–16 GiB 空闲） |
 | Python 依赖 | 缺哪个包、是否要装 |
 | ImageNet / dummy 数据 | `data/imagenet` 是否为仓库要求的 `folder + .meta.json` 格式 |
 | 权重文件 | `snapshots/` 里有没有 checkpoint、缺哪个 |
 | HF 缓存 | LDM（latent-space）模型需要 `stabilityai/sd-vae-ft-ema` |
 
-**结论会写在最后一段 “5. Recommendation”。** 如果它说 free VRAM < 3 GiB，
-那只能做单张推理，训练要等显卡空出来。
+**结论会写在最后一段 “5. Recommendation”。** 如果它说 free VRAM < 8 GiB，
+那只适合推理；训练建议等显存更宽裕时再跑。
+
+---
+
+## 0.5 这些单卡配置 vs. 原版 α-Flow：改了什么、没改什么
+
+**没有改的东西（算法/模型本体）**：
+`configs/loss/alphaflow.yaml`、`src/training/loss.py` 里的 `AlphaFlowLoss`、
+`configs/model/*` 的 DiT/SiT 结构、τ 采样与 α 调度公式、`src/inference.py` 的采样器——
+全部保持原样；官方 8 卡实验（`experiments-alphaflow.yaml` 里原有的那些条目）也一行没动。
+
+**为了单卡能跑，改了的东西**：
+
+| 项目 | 官方 8 卡 | 本单卡预设 | 是否影响算法/可比性 |
+|---|---|---|---|
+| 并行 | `torchrun` + FSDP/DDP | 1 卡、`dp.strategy=null`、`direct_launch` | 不影响数学 |
+| latent 提取 | 官方 B/2 用**预提取** latent 加快训练 | **即时 VAE 编码**（数学等价，只是每步更慢） | 不影响（预提取路径也保留） |
+| 全局 batch | 256（batch_gpu 32 × 8 卡） | 256（batch_gpu 32 × 8 次梯度累积 / 1 卡） | 一致 |
+| 训练步数 | 400k（非 cfg）/ 1.2M（cfg） | 相同 | 一致 |
+| 训练中评测 | joint_image_fd512_full / fd50k_full 等 | **FID-2048**，去掉 NFE-2 一致性评测 | ⚠️ 论文数字不可直接横比；你的各变体之间可比 |
+| W&B / 画图频率 | 开 | 默认关、频率降低 | 不影响 |
+
+所以注册表里的这些条目**是原版 B/2 配方在单卡上的“同协议运行”**，不是把模型改小：
+
+- `alphaflow-*-latentspace-B-2-single-gpu`（FM / MeanFlow / α-Flow）：**12 blocks, dim 768, 12 heads,
+  lr 1e-4, batch 256, 400k 步，α 调度与原版一致**。单卡跑完 400k 步约 **2–4 天/个**。
+- `alphaflow-*-latentspace-B-2-cfg-single-gpu`：**官方 cfg 训练配方**（label_dropout=0.1,
+  kappa=0.5, 1.2M 步），更接近论文主表/`*-cfg` 权重；单卡跑完约 **1–2 周/个**。
+  算力紧时可用 `training.max_steps=100000` 做同预算对比。
+- `alphaflow-smoke-test-*`：**只有这两个是“缩小版”**——6 blocks/dim 256（像素空间）或
+  2 blocks/dim 128（LDM），64/128 分辨率，几十步，纯粹用来 1 分钟验证数据/损失/优化器/
+  checkpoint 链路是否通，**不代表 α-Flow 效果**。
+
+如果要做“改模型 vs 原版”的对照：建议 3 个变体都用
+`alphaflow-*-latentspace-B-2-single-gpu`（同样的 400k 步预算）或全部用
+`-cfg-single-gpu` + 相同的更短步数，保证预算一致即可。
 
 ---
 
@@ -181,6 +216,15 @@ bash scripts/train_single_gpu.sh alphaflow-meanflow-latentspace-B-2-single-gpu
 bash scripts/train_single_gpu.sh alphaflow-latentspace-B-2-single-gpu
 ```
 
+以上是**非 cfg** 配方（原版 400k 步、batch 256）。如果你要对标论文主表/`*-cfg` 权重，
+用官方 cfg 训练配方的单卡版（1.2M 步，batch 256，batch_gpu=16 累积 16 次）：
+
+```bash
+bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-cfg-single-gpu    # α-Flow cfg
+bash scripts/train_single_gpu.sh alphaflow-meanflow-latentspace-B-2-cfg-single-gpu    # MeanFlow cfg
+# 预算紧：加 training.max_steps=100000，三个变体用同样的步数即可公平对比
+```
+
 默认配置：**1 卡、B/2、256×256 latent-space、全局 batch 256（batch_gpu=32 × 8 次梯度累积）、
 400k steps、推理端 NFE-1、每 25k 步算一次 FID-2048、W&B 关闭**。
 latent 由 VAE 在每个 micro-batch 上即时编码（不需要事先提取全量 latent）。
@@ -205,12 +249,14 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
 
 | 配置 | 训练显存（估） | 说明 |
 |---|---|---|
-| B/2 latent，batch_gpu=32 | ~10–16 GiB | 默认，需要整卡 |
-| B/2 latent，batch_gpu=16 | ~7–10 GiB | 显存紧张时 |
+| B/2 latent，batch_gpu=32 | ~10–16 GiB | 默认，需要 ≥16 GiB 空闲 |
+| B/2 latent，batch_gpu=16 | ~7–10 GiB | 显存紧张时（cfg 预设默认用它） |
 | B/2 latent，batch_gpu=8 | ~5–7 GiB | 更慢 |
-| 2–3 GiB 空闲 | **不可训练** | 只能推理，等显卡空出来 |
+| < 8 GiB 空闲 | 不建议训练 | 先跑推理 |
 
-> 32 GiB 卡上 B/2 预计 ~20–40k steps / 小时（还取决于 CPU/数据读取），400k 步大约 1–2 天。
+> 单卡 5090 上 B/2、batch 256（8 次累积）预计 **~5–15k optimizer steps / 小时**
+> （受数据读取和同卡其他进程影响）。400k 步约 **2–4 天**；cfg 配方 1.2M 步约 **1–2 周**。
+> 做算法迭代时，建议先用 `training.max_steps=20000` 左右短跑看相对趋势。
 
 ---
 

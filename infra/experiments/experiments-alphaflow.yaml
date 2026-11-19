@@ -350,3 +350,62 @@ alphaflow-sigmoid-latentspace-B-2-single-gpu:
   _inherit_: alphaflow-latentspace-B-2-single-gpu
   overrides:
     loss: {alpha: {scheduler: sigmoid, initial_value: 1.0, end_value: 0, change_init_steps: 0, change_end_steps: 400000, clamp_value: 0.005, gamma: 25.0}, ratio_fm: {scheduler: constant, initial_value: 0.5}}
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: the official *CFG-training* recipes on one GPU
+# (label_dropout=0.1, guidance baked into training via omega/kappa,
+#  max_steps=1.2M -- these are the settings behind the released `*-cfg`
+#  checkpoints and the paper's headline FID table).
+#
+# Same global batch as the official recipe (256), but batch_gpu=16 with
+# 16 gradient-accumulation rounds so it fits in 32 GiB.
+# NOTE: a full 1.2M-step run takes ~1-2 weeks on a single RTX 5090.
+# For controlled comparisons under a tighter compute budget, override
+#   training.max_steps=100000
+# (all variants use exactly the same budget, so the comparison stays fair).
+# ---------------------------------------------------------------------------
+alphaflow-latentspace-B-2-cfg-single-gpu:
+  _inherit_: alphaflow-latentspace-B-2-cfg-training
+  overrides:
+    num_gpus: 1
+    direct_launch: true
+    max_restarts: 0
+    quiet_launch: true
+    wandb: {enabled: false}
+    training:
+      max_steps: 1200000
+      metrics: [fid2048_full]
+      metrics_rare: []
+      metrics_final: []
+      metrics_extra_sampling_cfg_overwrites:
+        ~NFE_2_consistency_sampling: ~
+      num_vis_samples: 8
+      traj_len_for_vis_gen: 1
+      log_loss_across_gpus: false
+      dp: {strategy: null}
+      freqs: {snapshot: 200000, snapshot_latest: 5000, save_samples: 20000, loss_train_commit: 10, loss_per_sigma: null, loss_val: null, metrics: 50000, metrics_rare: null, param_stats: null, ctrl_check: 10}
+    sampling:
+      num_steps: 1
+      sigma_noise: 1.0
+      enable_trajectory_sampling: true
+      enable_consistency_sampling: false
+    dataset:
+      batch_gpu: 16
+      batch_size: 256
+      num_workers: 8
+      test_batch_gpu: 4
+      gen_batch_gpu: 2
+      metrics_detector_batch_gpu: 16
+    model:
+      checkpointing: true
+      ema_halflife_steps: 6931
+
+alphaflow-meanflow-latentspace-B-2-cfg-single-gpu:
+  _inherit_: alphaflow-latentspace-B-2-cfg-single-gpu
+  overrides:
+    loss: {ratio_fm: {scheduler: constant, initial_value: 0.5}, alpha: {scheduler: constant, initial_value: 0.0}, clamp_utgt: 4.0}
+
+alphaflow-sigmoid-latentspace-B-2-cfg-single-gpu:
+  _inherit_: alphaflow-latentspace-B-2-cfg-single-gpu
+  overrides:
+    loss: {ratio_fm: {scheduler: constant, initial_value: 0.25}, alpha: {scheduler: sigmoid, initial_value: 1.0, end_value: 0, change_init_steps: 0, change_end_steps: 1200000, clamp_value: 0.005, gamma: 25.0}}
