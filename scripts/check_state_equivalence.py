@@ -557,25 +557,28 @@ def section_c_gradients(net_v, net_s, cfg, device):
 # ---------------------------------------------------------------------------
 
 def section_d_sampling(net_v, net_s, cfg, device):
-    print('\n=== D. Sampling equivalence (state vs velocity) ===')
+    print('\n=== D. Sampling equivalence (state vs velocity), per-step intermediates ===')
     b = 2
     torch.manual_seed(3)
     z = torch.randn(b, *net_v.input_shape, device=device)
 
     def run(net, pairs, scale):
+        """Returns the per-step intermediate states: [(x_next, x_denoised), ...]."""
         sampling_cfg = copy.deepcopy(cfg.sampling)
         sampling_cfg.enable_trajectory_sampling = True
         sampling_cfg.enable_consistency_sampling = False
         sampling_cfg.cfg = EasyDict(scale=scale, t_min=0.0, t_max=1.0)
         x = z
+        trajectory = []
         for t_cur, t_next in pairs:
-            x, _, _ = reverse_recflow_step(
+            x, x_denoised, _ = reverse_recflow_step(
                 net=net, sampling_cfg=sampling_cfg, x_cur=x,
                 t_cur=torch.full((b,), float(t_cur), device=device),
                 t_next=torch.full((b,), float(t_next), device=device),
                 sc_latents=None, dtype=torch.float32,
             )
-        return x
+            trajectory.append(EasyDict(x_next=x.clone(), x_denoised=x_denoised.clone()))
+        return trajectory
 
     cases = [
         ('NFE-1', [(1.0, 0.0)], 1.0),
@@ -584,13 +587,22 @@ def section_d_sampling(net_v, net_s, cfg, device):
         ('NFE-2 + CFG(1.5)', [(1.0, 0.5), (0.5, 0.0)], 1.5),
     ]
     for name, pairs, scale in cases:
-        out_v = run(net_v, pairs, scale)
-        out_s = run(net_s, pairs, scale)
-        d = rel_diff(out_s, out_v)
-        report(f'[{name}] state sampler == velocity sampler', d < 1e-4, f'max rel diff = {d:.3e}')
-        report(f'[{name}] outputs finite', bool(torch.isfinite(out_s).all()))
+        traj_v = run(net_v, pairs, scale)
+        traj_s = run(net_s, pairs, scale)
+        all_steps_ok = True
+        # Compare EVERY intermediate state, not only the final one.
+        for step_idx, (step_v, step_s) in enumerate(zip(traj_v, traj_s)):
+            d_next = rel_diff(step_s.x_next, step_v.x_next)
+            d_denoised = rel_diff(step_s.x_denoised, step_v.x_denoised)
+            ok = d_next < 1e-4 and d_denoised < 1e-4
+            all_steps_ok = all_steps_ok and ok
+            report(f'[{name}] step {step_idx + 1}/{len(pairs)} intermediate state == velocity',
+                   ok, f'x_next rel diff = {d_next:.3e}, x_denoised rel diff = {d_denoised:.3e}')
+        d_final = rel_diff(traj_s[-1].x_next, traj_v[-1].x_next)
+        report(f'[{name}] final generated state equal', d_final < 1e-4, f'max rel diff = {d_final:.3e}')
+        report(f'[{name}] outputs finite', bool(torch.isfinite(traj_s[-1].x_next).all()))
 
-    # NFE-1 state output should be the analytic z - (t-r)u
+    # NFE-1 state output should be the analytic z - (t-r)u at (t=1, r=0).
     sampling_cfg = copy.deepcopy(cfg.sampling)
     sampling_cfg.enable_trajectory_sampling = True
     sampling_cfg.cfg = EasyDict(scale=1.0, t_min=0.0, t_max=1.0)
@@ -603,7 +615,7 @@ def section_d_sampling(net_v, net_s, cfg, device):
         u = net_v(z, sigma=torch.ones(b, 1, 1, 1, 1, device=device), sigma_next=torch.zeros(b, 1, 1, 1, 1, device=device), cond=net_v.construct_dummy_cond(b, device))
         analytic = z - 1.0 * u
     d = rel_diff(out_s, analytic)
-    report('NFE-1 state output == z_1 - u(z_1, 0, 1)', d < 1e-4, f'max rel diff = {d:.3e}')
+    report('NFE-1 state output == z_1 - u(z_1, 0, 1) (analytic)', d < 1e-4, f'max rel diff = {d:.3e}')
 
 
 # ---------------------------------------------------------------------------

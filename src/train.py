@@ -232,9 +232,13 @@ def train(cfg: DictConfig):
             # Freeing the previous memory. Can be expensive, so doing it once per tick only before doing the maintenance.
             misc.free_memory()
 
-            # Print the status line.
+            # Print the status line (includes per-component losses and the gradient norm, which is
+            # enough to diagnose training stability without wandb).
             tick_stats.end_time = time.time()
-            logging_utils.print_tick_stats0(stats, tick_stats, loss_means['total'].mean(), device, maintenance_time)
+            extra_stats = {f'loss_{loss_key}': float(loss_value.mean()) for loss_key, loss_value in loss_means.items()}
+            for stats_dict in (net_grad_log_dict, grad_norm_log_dict):
+                extra_stats.update({k.replace('Grad/', 'grad_'): float(v) for k, v in stats_dict.items()})
+            logging_utils.print_tick_stats0(stats, tick_stats, loss_means['total'].mean(), device, maintenance_time, extra_stats=extra_stats)
             if cfg.wandb.enabled:
                 sec_per_nimg = (tick_stats.end_time - tick_stats.start_time) / (stats.cur_nimg - tick_stats.start_nimg + 1e-16)
                 progress_stats_to_log = {

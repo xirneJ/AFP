@@ -268,7 +268,7 @@ def retry_function(fn: Callable, num_retries: int, error_msg: str='') -> Any:
 
 #----------------------------------------------------------------------------
 
-def print_tick_stats0(stats, tick_stats, loss_mean: float, device, maintenance_time) -> None:
+def print_tick_stats0(stats, tick_stats, loss_mean: float, device, maintenance_time, extra_stats: dict | None = None) -> None:
     fields = []
     sec_per_nimg = (tick_stats.end_time - tick_stats.start_time) / (stats.cur_nimg - tick_stats.start_nimg)
     step_per_sec = (stats.cur_step - tick_stats.start_step) / (tick_stats.end_time - tick_stats.start_time)
@@ -287,6 +287,8 @@ def print_tick_stats0(stats, tick_stats, loss_mean: float, device, maintenance_t
     fields += [f"gpumem {torch.cuda.max_memory_allocated(device) / 2**30:<6.2f}"]
     fields += [f"reserved {torch.cuda.max_memory_reserved(device) / 2**30:<6.2f}"]
     fields += [f"loss {loss_mean:<4.3f}"]
+    if extra_stats:
+        fields += [f"{field_name}={float(value):.5g}" for field_name, value in extra_stats.items()]
 
     dist.print0(' '.join(fields))
 

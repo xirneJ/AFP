@@ -10,6 +10,20 @@ f_theta(z_t, r, t) = z_t - (t - r) * u_theta(z_t, r, t)
 `u` 换成 `z_r`，并且与官方 velocity 模型**严格数学等价**（可逐项核对 loss / 梯度），
 作为后续机制消融的干净起点。
 
+## 0. 版本定义（后续 FID 对比的基准口径）
+
+后续所有 FID 对比都必须明确使用哪一版作为基准。三版本定义：
+
+| 版本 | 含义 | 用途 |
+| --- | --- | --- |
+| **Original Official** | 官方发布代码的原始语义：velocity 参数化 + 原版 `cat([c 目标, d 目标])` 配对 | **仅作审计/数学参照**；不直接用于产出 FID 数字 |
+| **Corrected Velocity** | 本仓库生产代码的 velocity 路径：velocity 参数化 + 按原样本顺序回填目标 | **正式 FID 基线**（所有对比实验的基准） |
+| **Corrected State** | 本仓库生产代码的 state 路径：state 参数化 + 同样的目标回填 | 候选模型（阶段一验证对象） |
+
+关键事实：**Corrected Velocity 与 Original Official 在官方采样器能产生的所有 batch 上
+逐位一致**（见 §1.7 与验证套件 A 组）。因此用 Corrected Velocity 作 FID 基线不会偏离
+官方实现；Original Official 只用于展示"如果使用非均匀 mask 的假设实现会错配"。
+
 ---
 
 ## 1. 原版 `AlphaFlowLoss` 各分支的准确计算过程（按代码，不按公式）
@@ -19,9 +33,13 @@ f_theta(z_t, r, t) = z_t - (t - r) * u_theta(z_t, r, t)
 ### 1.1 采样 `sample_traj_params`（L449-464）
 
 - `ratio_fm = get_ratio(cfg.ratio_fm)`；`alpha = get_ratio(cfg.alpha)`
-- batch 前 `batch_size_fm = int(batch_size * ratio_fm)` 个样本是 **FM 分支**：
+- `batch_size_fm = int(batch_size * ratio_fm)`，**FM 样本固定在 batch 前 `batch_size_fm` 位**：
   `t_fm = t_next_fm`（即 `r = t`），`dt_fm = 0`
 - 其余为 **MF 分支**：`t_mf > t_next_mf`（`t > r`），`dt_mf = alpha * (t_mf - t_next_mf)`
+- 组装方式（代码事实）：`t = cat([t_fm, t_mf])`、`t_next = cat([t_next_fm, t_next_mf])`、
+  `dt = cat([dt_fm, dt_mf])`；随后 loss 里这些逐样本张量**按原顺序**作用在 `x`/`cond` 上，
+  中间没有任何 permutation。因此 **FM 样本始终是 batch 前缀**（`ratio_fm=0` 时为空，
+  `ratio_fm=1` 时为全 batch，都平凡满足前缀性质）。
 - 注意 `get_ratio`（L380-427）的 clamp 语义：
   - `current_ratio < clamp_value` → **0.0**（除非 `discrete_training`）
   - `current_ratio > 1 - clamp_value` 或超过 `up_clamp_value` → **1.0**
@@ -88,16 +106,26 @@ loss_i   = weight_i * L_i / (L_i.detach() + adaptive_loss_weight_eps)   # eps = 
    官方实现里**没有** EMA teacher。EMA teacher 因此是阶段二的一个真实机制差异。
 2. **batch 目标拼接与对齐**：原实现把目标按 `cat([c 目标, d 目标])` 重排，而预测按原始
    batch 顺序计算；只有当 `mask_c` 是 batch 前缀（或全为 True）时才逐样本对应。
-   **进一步审计结论（修正早期判断）**：`alpha` 是**每步一个标量**，所以
-   `dt = alpha·(t-r)` 对同一 batch 的所有 MF 样本相同 → `mask_c` 只可能是
-   - `alpha > 0`：只有前缀 FM 样本 `dt=0` → `mask_c` 是前缀；
-   - `alpha == 0`：所有 MF 样本 `dt=0` → `mask_c` 为全 True。
 
-   因此**官方采样器能产生的任何 batch 上，原实现都是对齐的**，并不存在实际错配。
+   **精确条件（代码事实）**：FM 样本始终是 batch 前缀，来自 `sample_traj_params` 的组装顺序
+   `t = cat([t_fm, t_mf])`、`dt = cat([dt_fm, dt_mf])`（`dt_fm` 全 0），且 loss 中这些逐样本
+   张量按原顺序作用于 `x`/`cond`，中间没有 permutation。于是
+   `mask_c = (dt == 0)` 是否整体为前缀，只取决于 MF 部分：
+   - `alpha > 0` 且对**所有** MF 样本都 `t > r` 严格成立 → `mask_c` 恰好是 FM 前缀；
+   - `alpha == 0` → 所有 MF 样本 `dt=0` → `mask_c` 为全 True（前缀性质平凡成立）；
+   - `ratio_fm = 0` / `1` → `mask_c` 分别为全 False / 全 True，均平凡满足；
+   - **唯一破坏前缀性质的边缘情形**：`alpha > 0` 但个别 MF 样本恰好 `t == r`（`dt` 舍入为 0），
+     例如使用离散 `custom_t_steps` 网格，或极端 float32 碰撞。该情形在连续 logit_norm
+     采样下概率为 0（正常训练不会出现），但修正版按原序回填目标对该情形也正确，
+     而 Original Official 的 `cat` 配对会错位——这正是"A 组 interleaved 对抗测试"验证的内容。
+
+   因此**官方采样器能产生的任何 batch 上，原实现都是对齐的**，不存在实际错配。
    修正版按原始样本顺序回填目标（`mean_velocity[mask_c] = ...`）：在所有真实 batch 上与原版
-   **逐位一致**，只对"非均匀 dt 模式"（例如将来改成 per-sample alpha 调度）保持正确。
+   **逐位一致**，只对上述边缘/未来非均匀 dt 模式保持正确。
    审计脚本用**人为构造的 interleaved mask** 证明：原版配对在该模式下错配，
    修正版与"逐样本独立参考实现"一致；真实模式（fm / d / alpha0）下三版本结果相同。
+3. **`clamp_utgt` 的位置**：只在 d 分支、且只在**速度空间**裁剪；c 分支（FM + α=0 JVP）
+   不裁剪。state 转换必须保留该语义（先得到 `u_tgt` → 裁剪 → `f_tgt = z_t-(t-r)u_tgt`）。
 3. **`clamp_utgt` 的位置**：只在 d 分支、且只在**速度空间**裁剪；c 分支（FM + α=0 JVP）
    不裁剪。state 转换必须保留该语义（先得到 `u_tgt` → 裁剪 → `f_tgt = z_t-(t-r)u_tgt`）。
 
@@ -135,13 +163,45 @@ loss_i   = weight_i * L_i / (L_i.detach() + adaptive_loss_weight_eps)   # eps = 
 - **数值稳定**：`(t-r)^2` 除以的区间严格 > 0（state 分支断言），α=0 样本走 JVP 分支不除零；
   `clamp_utgt` 仍在 velocity 空间生效后再转 state，等价性不受影响。
 
+### 2.1 "梯度等价"的准确含义（区分三层，不能混为一谈）
+
+函数映射等价（`f = z_t-(t-r)u`）**并不意味着**两个不同结构的网络参数梯度逐元素相等。
+验证套件分别检查三层，成立条件如下：
+
+| 层级 | 检查内容 | 成立条件 | 是否"相等" |
+| --- | --- | --- | --- |
+| **输出梯度** | `dL_s/du == dL_v/du`（对同一预测 u） | 只需 `f = z_t-(t-r)u` 在数值上成立；与网络结构无关，是纯代数关系 | 相等 |
+| **trunk 参数梯度** | 共享 trunk 的 `∂L/∂θ` 两侧一致 | ①两侧 trunk 参数**完全相同**（net_s 从 net_v 复制）；②**state 头 = 取负的 velocity 头**（`W_s=-W_v, b_s=-b_v`）；③同一 loss/权重。在这些条件下 `∂L_s/∂θ = ∂L_v/∂θ` | 相等（**仅在初始化点**） |
+| **head 参数梯度** | `∂L_s/∂W_s` vs `∂L_v/∂W_v` | 同上条件，且由 `raw_state = -raw_velocity` 可知 `∂L_s/∂W_s = -∂L_v/∂W_v` | **互为相反数，不是相等** |
+
+关键限定：
+
+- 上述 trunk 相等是**初始化点**的恒等式（因为 dual-head 模型里 velocity 头只从 FM 样本拿梯度、
+  state 头只从一致性样本拿梯度；一步优化后两个头不再保持取负关系，trunk 梯度也不再相等）。
+  验证脚本显式在"取负初始化 + 相同输入"的瞬间做检查，这正是"重参数化等价"的精确含义。
+- **head 参数不是"等价"，而是镜像关系**：不同 head 结构（单头 vs 双头）不存在逐参数等价，
+  不能把函数等价直接写成"参数梯度相同"。
+- 采样等价（D 组）属于**函数/数值**层面的等价，不涉及梯度。
+
 ---
 
-## 3. 等价性验证套件（不训练、不需要数据/权重）
+## 3. 验证报告 Part I — 数学 / 数值 / 代码等价性（硬性容限）
 
 `scripts/check_state_equivalence.py` 在小 pixel-space SiT（registry 的 smoke preset，64×64，
 dummy dataset）上建立**同一函数**的 velocity 模型与 state 模型（net_s 的 state 头 =
-net_v 的 velocity 头取负），然后执行四组检查（fp32、确定性、约 1 分钟）：
+net_v 的 velocity 头取负），执行 A–D 四组检查（fp32、确定性、约 1 分钟）。
+**Part I 要求全部在下列容限内通过**：
+
+| 检查 | 容限 |
+| --- | --- |
+| 预测转换 `f == z-(t-r)u`（含极小间隔） | max rel diff < 1e-5 |
+| 未加权 loss `L_s == L_v`（d/JVP/FM 三分支） | max rel diff < 1e-5 |
+| adaptive 权重 / 最终 loss | weight < 1e-5；loss < 1e-3 |
+| 输出梯度 `dL_s/du == dL_v/du` | max rel diff < 1e-5 |
+| trunk 参数梯度（取负初始化点） | rtol 1e-4 / atol 1e-6 |
+| head 参数梯度镜像关系 `g_s == -g_v` | rtol 1e-4 / atol 1e-6 |
+| 采样：**每一步中间状态** + 最终状态（NFE-1/2，含 CFG） | max rel diff < 1e-4 |
+| 所有分支的 loss / pred / grad | 有限（无 NaN/Inf），无除零 |
 
 ### A. Batch 对齐审计（三版本对照）
 
@@ -174,9 +234,11 @@ state == velocity；以及 legacy 与 corrected 的差异。
 - adaptive 分母 detach 验证（`d(loss)/dL == w.detach()`）；
 - NaN/Inf/除零检查（各分支 + 极小间隔）。
 
-### D. 采样等价（不额外增加 NFE）
+### D. 采样等价（不额外增加 NFE，**逐步骤比较**）
 
-- NFE-1、NFE-2、NFE-1+CFG(2.0)、NFE-2+CFG(1.5)：state 采样 == velocity 采样；
+- NFE-1、NFE-2、NFE-1+CFG(2.0)、NFE-2+CFG(1.5)：
+  对**每一步**都比较 `x_next`（中间状态）与 `x_denoised`，而不只比较最终结果；
+- 再检查最终生成状态；
 - NFE-1 state 输出 == 解析结果 `z_1 - u(z_1,0,1)`。
 
 运行（服务器仓库根目录）：
@@ -191,29 +253,45 @@ python scripts/check_state_equivalence.py
 
 > 说明：由于 dual-head 方案本身多了一个输出头，**训练动力学**与单头 velocity 模型不是
 > 逐参数完全相同（state 头只从一致性分支拿梯度，velocity 头只从 FM 分支拿梯度）；
-> 但"loss 值 / 每分支梯度 / trunk 梯度 / 采样输出"在初始化点严格等价。
+> 但上述 Part I 的所有量在"取负初始化点 + 相同输入"下严格等价。
 > 这是阶段一"严格等价重参数化"的准确含义，也是后续消融要隔离的结构差异。
 
 ---
 
-## 4. 阶段一之后的最小 sanity check（1–2k steps）
+## 4. 验证报告 Part II — 1–2k steps 短训练 sanity（软指标）
 
-先训 dummy pixel 版（几分钟，验证双头、state loss、state 采样都能跑通，不需要 ImageNet）：
+Part II **不要求**两种参数化的训练曲线逐点重合（它们结构不同、梯度来源不同），
+只检查训练稳定性和基本一致性。**硬性条件**：loss/grad 有限（无 NaN/Inf）、
+两种都跑完目标步数/正常结束。**软指标**：初始 loss 接近、grad norm 量级合理、
+无爆炸/发散。
+
+先训 dummy pixel 版（几分钟，不需要 ImageNet；`steps_per_tick=10` 让日志足够密）：
 
 ```bash
-# velocity 对照（官方参数化）
+# velocity 对照
 bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu \
-  desc=stage1-smoke-velocity training.max_steps=1000
+  desc=stage1-smoke-velocity training.max_steps=1000 training.steps_per_tick=10
 
 # state 版
 bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu \
-  desc=stage1-smoke-state model.parameterization=state training.max_steps=1000
+  desc=stage1-smoke-state model.parameterization=state training.max_steps=1000 training.steps_per_tick=10
 ```
 
-看 `runs/stage1-smoke-{velocity,state}/log.txt` 中 `Loss/total` 曲线：两者应在起始
-**几乎重合**（同初始化、同 batch、同 loss 公式），随后因输出参数化/双头结构略有差异；
-同时记录 `Loss/trajectory_*`、`Grad/norm`、有无 NaN/Inf、以及最终生成样本
-（`runs/stage1-smoke-*/generate/` 或 log 中保存的图）。
+> 本轮起 `log.txt` 的 tick 行会额外输出
+> `loss_total=... loss_trajectory_FM=... loss_trajectory_consistency=... grad_norm=...`
+> （原先只有 `loss` 汇总值），用于 Part II 报告。
+
+生成 Part II 报告：
+
+```bash
+python scripts/summarize_stage1_sanity.py \
+  --velocity-dir runs/stage1-smoke-velocity \
+  --state-dir runs/stage1-smoke-state \
+  --expected-steps 1000
+```
+
+报告内容：两边的 ticks、`loss_total` 首/末/极值、`grad_norm` 首/末/最大值、iter/sec、
+NaN/Inf 检查、以及初始窗口/全程的 loss 相对差异（仅供参考，不作为"必须重合"的判据）。
 
 再在 latent B/2 上做 1–2k steps 微调（需要先把 `data/imagenet/train` 接好）：
 
@@ -228,7 +306,7 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   training.resume.on_start_ckpt_path="$PWD/snapshots/alphaflow-B-2-finetune-init.pt" \
   training.resume.whole_state=false \
   model.ema_rampup_ratio=null \
-  training.max_steps=2000 \
+  training.max_steps=2000 training.steps_per_tick=10 \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null \
   training.freqs.metrics=null training.freqs.save_samples=null
 
@@ -240,9 +318,18 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   training.resume.whole_state=false \
   training.resume.allow_missing_keys=true \
   model.ema_rampup_ratio=null \
-  training.max_steps=2000 \
+  training.max_steps=2000 training.steps_per_tick=10 \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null \
   training.freqs.metrics=null training.freqs.save_samples=null
+```
+
+同样的 Part II 报告也可用于 latent 微调：
+
+```bash
+python scripts/summarize_stage1_sanity.py \
+  --velocity-dir runs/stage1-ft2k-velocity \
+  --state-dir runs/stage1-ft2k-state \
+  --expected-steps 2000
 ```
 
 ---
