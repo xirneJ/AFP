@@ -58,4 +58,9 @@ seed: 1 # Random seed
 # Some hardware optimization parameters.
 cudnn_benchmark: true # Enable cuDNN benchmarking
 allow_tf32: true
+# Force the math SDPA backend (disables FlashAttention / mem-efficient / cuDNN attention).
+# REQUIRED for alpha-Flow and MeanFlow training: their loss takes a JVP (higher-order
+# derivative) through the network, which FlashAttention's backward does not implement.
+# Set to false only for models/losses that never call jvp (e.g. pure FM training).
+force_math_attention: true
 grad_nan_to_num: true

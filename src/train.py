@@ -54,6 +54,13 @@ def train(cfg: DictConfig):
     _start_time = time.time()
     dist.init_random_state_and_cuda(seed, cfg.training.cudnn_benchmark, allow_tf32=cfg.training.allow_tf32)
 
+    # alpha-Flow / MeanFlow losses take a JVP (higher-order derivative) through the
+    # network; FlashAttention's backward does not implement it, so use the math SDPA
+    # backend during training. (No effect on generation/evaluation.)
+    if cfg.training.get('force_math_attention', True):
+        misc.force_math_attention()
+        dist.loginfo0('Forced math SDPA backend (required for the JVP in alpha-Flow/MeanFlow losses).')
+
     data: Data = Data.init_from_cfg(cfg.dataset)
     logging_utils.print_training_options(cfg, data, resumed_snapshot=resume_cfg.ckpt_path)
 

@@ -382,6 +382,16 @@ A: 全部在 `configs/env/user.yaml` 的 `experiments_root`（默认 `<仓库>/r
 **Q: 报 `no kernel image is available for execution on the device`**
 A: torch 版本不对（不是 cu128）。重装第 1 步。
 
+**Q: 训练报 `derivative for aten::_scaled_dot_product_flash_attention_backward is not implemented`**
+A: alpha-Flow/MeanFlow 的损失用 `torch.autograd.functional.jvp` 求二阶导，新版 torch
+默认选 FlashAttention 后端（backward 不支持高阶导）。训练配置已默认
+`training.force_math_attention: true`，会强制 math SDPA 后端（慢一点但数值一致）。
+若你手动关掉了，把它设回 true 或显式加 `training.force_math_attention=true`。
+
+**Q: 报 `torchaudio ... compiled with different CUDA versions`**
+A: torchaudio 是可选的（只有音视频保存用到），版本不匹配时已自动忽略；
+实在碍事就 `pip uninstall -y torchaudio`。
+
 **Q: 报 HF 下载失败（`stabilityai/sd-vae-ft-ema`）**
 A: 需要联网或预先把模型放进 `$HF_HOME`（默认 `./.cache/huggingface`）。
 纯离线环境：在能联网的机器上 `huggingface-cli download stabilityai/sd-vae-ft-ema`，

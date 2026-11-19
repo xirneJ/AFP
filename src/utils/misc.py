@@ -723,6 +723,31 @@ def filter_nones(d: EasyDict | dict) -> EasyDict | dict:
     return container_cls(**{k: v for k, v in d.items() if v is not None})
 
 #----------------------------------------------------------------------------
+# Attention backend utils.
+
+def force_math_attention() -> None:
+    """Disable FlashAttention / mem-efficient / cuDNN SDPA backends (keep math only).
+
+    alpha-Flow and MeanFlow training compute a JVP (higher-order derivative)
+    through the network (torch.autograd.functional.jvp in the loss). FlashAttention's
+    backward kernel does not implement the required higher-order derivative
+    (``RuntimeError: derivative for aten::_scaled_dot_product_flash_attention_backward
+    is not implemented``), so on new PyTorch versions we have to force the math
+    SDPA backend during training. It is slower but numerically identical.
+    """
+    try:
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(True)
+    except Exception:  # noqa: BLE001 - best-effort; older torch versions may lack some flags
+        pass
+
+#----------------------------------------------------------------------------
 # Gradient computation utils.
 
 def compute_param_grad(loss: torch.Tensor, param: torch.nn.Parameter) -> torch.Tensor:
