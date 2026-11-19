@@ -17,12 +17,19 @@ This script implements the requested audit/equivalence tests on a small pixel-sp
        - adaptive weighting: un-scaled loss, weights, detached denominator, final loss.
 
   C. Numerical & gradient tests:
+       - full-network output mapping f_state == z_t-(t-r)u (precond/skip/adaLN level, C0),
+         including a counter-test showing the relation breaks when the heads are not negations,
        - per-sample prediction conversion, output-gradient relation, parameter gradients,
        - detached adaptive-weight denominator, NaN/Inf/division-by-zero checks.
 
   D. Sampling equivalence (no extra NFE):
        - state sampler vs velocity sampler for NFE-1/NFE-2, with and without CFG,
+         comparing EVERY intermediate step (x_next and x_denoised), not only the final state,
        - state sampler output vs analytic z_t-(t-r)u.
+
+  E. Realistic branch-combination matrix:
+       - alpha=0 + CFG, alpha=1 target-branch skip, JVP branch without clipping,
+       - ratio_fm=0 / ratio_fm=1 boundaries (with and without CFG).
 
 Run from the repository root (GPU recommended):
     python scripts/check_state_equivalence.py
@@ -181,6 +188,28 @@ def make_batch(net, device, kind: str, seed: int = 0):
         for i, tv in enumerate([0.95, 0.85, 0.75, 0.65, 0.55, 0.45]):
             set_pair(i, tv, ratio=0.4)
             dt[i] = alpha * (t[i] - t_next[i])
+    elif kind == 'alpha1':
+        # All samples with alpha == 1: dt == t-r exactly (target branch is skipped in the code).
+        alpha = 1.0
+        for i, tv in enumerate([0.95, 0.85, 0.75, 0.65, 0.55, 0.45]):
+            set_pair(i, tv, ratio=0.4)
+            dt[i] = 1.0 * (t[i] - t_next[i])
+    elif kind == 'alpha0_all':
+        # All samples on the JVP branch (t > r, dt == 0, alpha == 0): corresponds to ratio_fm=0.
+        alpha = 0.0
+        for i, tv in enumerate([0.95, 0.85, 0.75, 0.65, 0.55, 0.45]):
+            set_pair(i, tv, ratio=0.4)
+    elif kind == 'mixed':
+        # Synthetic mix used only to test clipping semantics: 2 FM (c), 2 JVP (c), 2 d (clipped).
+        alpha = 0.5
+        for i, tv in enumerate([0.95, 0.85]):
+            t[i].fill_(tv)
+            t_next[i].fill_(tv)
+        for i, tv in enumerate([0.80, 0.70]):
+            set_pair(2 + i, tv, ratio=0.4) # dt == 0, t > r -> JVP (c-branch, not clipped)
+        for i, tv in enumerate([0.60, 0.45]):
+            set_pair(4 + i, tv, ratio=0.4)
+            dt[4 + i] = alpha * (t[4 + i] - t_next[4 + i])
     elif kind == 'interleaved':
         # Adversarial pattern: mask_c/mask_d interleaved; not producible by the official sampler
         # (alpha is a scalar per step), but it is exactly the pattern that exposes target mispairing.
@@ -381,11 +410,181 @@ def _state_ref_loss(pred_s, parts, is_fm, interval, eps, ref_weights):
     return L, w, w * L
 
 
+def run_case(cfg, net_v, net_s, cond, device, kind, loss_overrides=None):
+    """Builds one deterministic branch-combination case and returns all intermediate quantities."""
+    loss_overrides = loss_overrides or {}
+    loss_v = build_loss(cfg, device, 'velocity', **loss_overrides)
+    loss_s = build_loss(cfg, device, 'state', **loss_overrides)
+    eps = float(loss_v.cfg.adaptive_loss_weight_eps)
+    batch = make_batch(net_v, device, kind)
+    parts = reference_parts(loss_v, net_v, batch, cond)
+    b = batch.x.shape[0]
+    is_fm = torch.isclose(batch.t, batch.t_next).flatten()
+    interval = batch.t - batch.t_next
+    ref_weights = torch.where(
+        torch.isclose(batch.dt.flatten(), torch.zeros(b, device=device)),
+        torch.ones(b, device=device), torch.full((b,), batch.alpha, device=device),
+    )
+    with torch.no_grad():
+        pred_v = net_v(parts.x_t, sigma=batch.t, sigma_next=batch.t_next, cond=cond)
+        pred_s = torch.empty_like(parts.x_t)
+        if (~is_fm).any():
+            pred_s[~is_fm] = net_s(parts.x_t[~is_fm], sigma=batch.t[~is_fm],
+                                   sigma_next=batch.t_next[~is_fm], cond=cond[~is_fm], head='state')
+        if is_fm.any():
+            pred_s[is_fm] = net_v(parts.x_t[is_fm], sigma=batch.t[is_fm],
+                                  sigma_next=batch.t_next[is_fm], cond=cond[is_fm])
+    Lv, wv, lossv = per_sample_velocity_loss(pred_v, parts.targets.ref, ref_weights, eps)
+    Ls, ws, losss = _state_ref_loss(pred_s, parts, is_fm, interval, eps, ref_weights)
+    out_v = production_forward(loss_v, net_v, batch, cond)
+    out_s = production_forward(loss_s, net_s, batch, cond)
+    return EasyDict(
+        batch=batch, parts=parts, is_fm=is_fm, interval=interval, ref_weights=ref_weights,
+        loss_v=loss_v, loss_s=loss_s, eps=eps,
+        Lv=Lv, wv=wv, lossv=lossv, Ls=Ls, ws=ws, losss=losss,
+        out_v=out_v, out_s=out_s, pred_v=pred_v, pred_s=pred_s,
+    )
+
+
+def report_case_equivalence(name, res):
+    """Reports the common velocity-vs-state equivalence checks for one case."""
+    d_unscaled = rel_diff(res.Ls, res.Lv)
+    d_weights = rel_diff(res.ws, res.wv)
+    d_final = rel_diff(res.losss, res.lossv)
+    d_prod_v = rel_diff(res.out_v['total'], res.lossv)
+    d_prod_s = rel_diff(res.out_s['total'], res.losss)
+    d_sv = rel_diff(res.out_s['total'], res.out_v['total'])
+    report(f'[{name}] un-scaled loss equal', d_unscaled < TOL_FP32, f'max rel diff = {d_unscaled:.3e}')
+    report(f'[{name}] adaptive weights equal', d_weights < TOL_FP32, f'max rel diff = {d_weights:.3e}')
+    report(f'[{name}] adaptive-weighted final loss equal', d_final < TOL_DIFF, f'max rel diff = {d_final:.3e}')
+    report(f'[{name}] production V loss == reference', d_prod_v < TOL_DIFF, f'max rel diff = {d_prod_v:.3e}')
+    report(f'[{name}] production S loss == reference', d_prod_s < TOL_DIFF, f'max rel diff = {d_prod_s:.3e}')
+    report(f'[{name}] State loss == Velocity loss (per sample)', d_sv < TOL_DIFF, f'max rel diff = {d_sv:.3e}')
+    assert_finite(f'[{name}] losses/preds', res.out_v['total'], res.out_s['total'], res.pred_v, res.pred_s)
+
+
+# ---------------------------------------------------------------------------
+# C0. Full-network output mapping: state head vs velocity head (preconditioning,
+#     skip connection, adaLN scale/shift), and the "equality only at init" fact.
+# ---------------------------------------------------------------------------
+
+def section_c0_full_mapping(net_s, device):
+    print('\n=== C0. Full-network output mapping f_state == z_t - (t-r) u_velocity ===')
+    b = 4
+    cond = net_s.construct_dummy_cond(b, device)
+    # Use one-hot conditioned labels to exercise the conditional branch too.
+    cond.label = torch.zeros(b, *net_s.label_shape, device=device)
+    for i in range(b):
+        cond.label[i, i % int(net_s.label_shape[0])] = 1.0
+    torch.manual_seed(11)
+    z = torch.randn(b, *net_s.input_shape, device=device)
+
+    final_layer = net_s.model.final_layer
+    w_v, b_v = final_layer.linear.weight, final_layer.linear.bias
+    w_s, b_s = final_layer.linear_state.weight, final_layer.linear_state.bias
+    exact_negation = bool(torch.equal(w_s, -w_v) and torch.equal(b_s, -b_v))
+    report('head parameters are exact negations (W_s == -W_v, b_s == -b_v)', exact_negation,
+           f'max |W_s+W_v|={float((w_s + w_v).abs().max()):.3e}, max |b_s+b_v|={float((b_s + b_v).abs().max()):.3e}')
+    shared_modulation = (final_layer.linear is not final_layer.linear_state) and \
+                        hasattr(final_layer, 'adaLN_modulation') and hasattr(final_layer, 'norm_final')
+    report('heads live in the same FinalLayer (adaLN modulation + norm_final are applied once, '
+           'the heads are the only separate modules)', shared_modulation)
+
+    # Capture (a) the backbone input, (b) the shared final-norm/adaLN features fed into each head,
+    # and (c) each head's raw output. This proves the mapping holds at the *complete network output*
+    # level (preconditioning + skip connection + shared scale/shift), not merely "weights negated".
+    captured = {}
+    backbone_inputs = {}
+
+    def backbone_hook(module, args, kwargs, output):
+        _ = module, kwargs, output
+        backbone_inputs['last'] = args[0].detach().clone()
+
+    def make_head_hook(tag):
+        def head_hook(module, args, output):
+            _ = module
+            captured[tag] = {'input': args[0].detach().clone(), 'raw': output.detach().clone()}
+        return head_hook
+
+    h_backbone = net_s.model.register_forward_hook(backbone_hook, with_kwargs=True)
+    h_head_v = final_layer.linear.register_forward_hook(make_head_hook('velocity'))
+    h_head_s = final_layer.linear_state.register_forward_hook(make_head_hook('state'))
+
+    cases = [(1.0, 0.0), (0.8, 0.3), (0.5, 0.499), (0.9, 0.1)]
+    try:
+        for t_val, r_val in cases:
+            t = torch.full((b, 1, 1, 1, 1), t_val, device=device)
+            r = torch.full((b, 1, 1, 1, 1), r_val, device=device)
+            with torch.no_grad():
+                u = net_s(z, sigma=t, sigma_next=r, cond=cond, head='velocity')
+                backbone_input_velocity = backbone_inputs['last'].clone()
+                feature_v, raw_v = captured['velocity']['input'], captured['velocity']['raw']
+                f = net_s(z, sigma=t, sigma_next=r, cond=cond, head='state')
+                backbone_input_state = backbone_inputs['last'].clone()
+                feature_s, raw_s = captured['state']['input'], captured['state']['raw']
+            same_backbone_input = torch.equal(backbone_input_velocity, backbone_input_state)
+            same_head_features = torch.equal(feature_v, feature_s)
+            raw_negated = rel_diff(raw_s, -raw_v)
+            # State precond: f = c_skip*z_t + c_out*raw_s with c_skip=1, c_out=(t-r), c_in=1.
+            reconstructed = z + (t - r) * raw_s
+            d_recon = rel_diff(f, reconstructed)
+            d_map = rel_diff(f, z - (t - r) * u)
+            report(f'[t={t_val}, r={r_val}] backbone input identical for both heads', same_backbone_input)
+            report(f'[t={t_val}, r={r_val}] shared final-norm/adaLN features identical for both heads',
+                   same_head_features)
+            report(f'[t={t_val}, r={r_val}] raw state output == -raw velocity output', raw_negated < TOL_FP32,
+                   f'max rel diff = {raw_negated:.3e}')
+            report(f'[t={t_val}, r={r_val}] f == z_t + (t-r) raw_state (precond/skip reconstruction)',
+                   d_recon < TOL_FP32, f'max rel diff = {d_recon:.3e}')
+            report(f'[t={t_val}, r={r_val}] f_state == z_t - (t-r) u_velocity (full network output)',
+                   d_map < TOL_FP32, f'max rel diff = {d_map:.3e}')
+    finally:
+        h_backbone.remove()
+        h_head_v.remove()
+        h_head_s.remove()
+
+    # Degenerate target-time case r == t: the state precond has c_out = t-r = 0, so the state head
+    # is not meaningful there; the FM branch uses the velocity head instead. The code path guards
+    # against this with an assertion (positive interval required), which we verify here.
+    t = torch.full((b, 1, 1, 1, 1), 0.7, device=device)
+    raised = False
+    try:
+        with torch.no_grad():
+            _ = net_s(z, sigma=t, sigma_next=t, cond=cond, head='state')
+    except AssertionError:
+        raised = True
+    report('degenerate r == t: state head rejects the zero interval (FM branch uses the velocity head)',
+           raised)
+
+    # Counter-test: the mapping must BREAK once the heads are not negations. This proves the
+    # relation is an initialisation-time identity, not a property of the architecture.
+    t = torch.full((b, 1, 1, 1, 1), 0.8, device=device)
+    r = torch.full((b, 1, 1, 1, 1), 0.3, device=device)
+    with torch.no_grad():
+        f_before = net_s(z, sigma=t, sigma_next=r, cond=cond, head='state')
+        u_before = net_s(z, sigma=t, sigma_next=r, cond=cond, head='velocity')
+        final_layer.linear_state.weight.add_(0.1) # perturb the state head only
+        f_perturbed = net_s(z, sigma=t, sigma_next=r, cond=cond, head='state')
+        d_perturbed = rel_diff(f_perturbed, z - (t - r) * u_before)
+        # restore the exact negation
+        final_layer.linear_state.weight.copy_(-final_layer.linear.weight)
+        final_layer.linear_state.bias.copy_(-final_layer.linear.bias)
+    report('mapping no longer holds when the state head is not the negated velocity head (expected)',
+           d_perturbed > TOL_DIFF, f'rel diff after perturbing state head = {d_perturbed:.3e}')
+
+    # NOTE (also documented): after training the two heads are independent (the velocity head is
+    # only trained on the FM branch, the state head only on the consistency branch), so the
+    # equality f == z_t-(t-r)u is NOT preserved; it only serves as the initialisation equivalence.
+
+
+# ---------------------------------------------------------------------------
+# B. Branch-by-branch equivalence: d-branch / alpha=0 JVP / FM / CFG / clamp / adaptive.
+# ---------------------------------------------------------------------------
+
 def section_b_branches(net_v, net_s, cfg, device):
     print('\n=== B. Branch equivalence (Velocity vs State) ===')
     b = 6
     cond = net_v.construct_dummy_cond(b, device)
-
     scenarios = [
         ('d-branch (0<alpha<=1)', 'd', {}),
         ('alpha=0 JVP branch', 'alpha0', {}),
@@ -394,59 +593,99 @@ def section_b_branches(net_v, net_s, cfg, device):
         ('clamp_utgt active', 'd_all', {'clamp_utgt': 0.05}),
     ]
     for name, kind, loss_overrides in scenarios:
-        loss_v = build_loss(cfg, device, 'velocity', **loss_overrides)
-        loss_s = build_loss(cfg, device, 'state', **loss_overrides)
-        eps = float(loss_v.cfg.adaptive_loss_weight_eps)
-        batch = make_batch(net_v, device, kind)
-        parts = reference_parts(loss_v, net_v, batch, cond)
-        is_fm = torch.isclose(batch.t, batch.t_next).flatten()
-        interval = batch.t - batch.t_next
-        ref_weights = torch.where(torch.isclose(batch.dt.flatten(), torch.zeros(b, device=device)),
-                                  torch.ones(b, device=device), torch.full((b,), batch.alpha, device=device))
-
-        with torch.no_grad():
-            pred_v = net_v(parts.x_t, sigma=batch.t, sigma_next=batch.t_next, cond=cond)
-            pred_s = torch.empty_like(parts.x_t)
-            if (~is_fm).any():
-                pred_s[~is_fm] = net_s(parts.x_t[~is_fm], sigma=batch.t[~is_fm], sigma_next=batch.t_next[~is_fm],
-                                       cond=cond[~is_fm], head='state')
-            if is_fm.any():
-                pred_s[is_fm] = net_v(parts.x_t[is_fm], sigma=batch.t[is_fm], sigma_next=batch.t_next[is_fm], cond=cond[is_fm])
-
-        Lv, wv, lossv = per_sample_velocity_loss(pred_v, parts.targets.ref, ref_weights, eps)
-        Ls, ws, losss = _state_ref_loss(pred_s, parts, is_fm, interval, eps, ref_weights)
-        out_v = production_forward(loss_v, net_v, batch, cond)
-        out_s = production_forward(loss_s, net_s, batch, cond)
-
-        # un-scaled loss / weights / final loss
-        d_unscaled = rel_diff(Ls, Lv)
-        d_weights = rel_diff(ws, wv)
-        d_final = rel_diff(losss, lossv)
-        report(f'[{name}] un-scaled loss equal', d_unscaled < TOL_FP32, f'max rel diff = {d_unscaled:.3e}')
-        report(f'[{name}] adaptive weights equal', d_weights < TOL_FP32, f'max rel diff = {d_weights:.3e}')
-        report(f'[{name}] adaptive-weighted final loss equal', d_final < TOL_DIFF, f'max rel diff = {d_final:.3e}')
-        # production forward consistency
-        report(f'[{name}] production V loss == reference', rel_diff(out_v['total'], lossv) < TOL_DIFF,
-               f'max rel diff = {rel_diff(out_v["total"], lossv):.3e}')
-        report(f'[{name}] production S loss == reference', rel_diff(out_s['total'], losss) < TOL_DIFF,
-               f'max rel diff = {rel_diff(out_s["total"], losss):.3e}')
-
+        res = run_case(cfg, net_v, net_s, cond, device, kind, loss_overrides)
+        report_case_equivalence(name, res)
         # CFG scenario: make sure guidance actually changed the target (test is meaningful)
         if 'CFG' in name:
-            d_guided = rel_diff(parts.velocity_cfg, parts.velocity)
+            d_guided = rel_diff(res.parts.velocity_cfg, res.parts.velocity)
             report(f'[{name}] guidance actually modifies the target velocity', d_guided > TOL_DIFF,
                    f'rel diff(velocity_cfg, velocity) = {d_guided:.3e}')
         # clamp scenario: clipping is active in velocity space and preserved by the state conversion
         if 'clamp' in name:
-            max_tgt = float(parts.targets.ref.abs().max())
-            f_tgt = parts.x_t - interval * parts.targets.ref
-            u_recovered = (parts.x_t - f_tgt) / interval
-            d_recover = rel_diff(u_recovered, parts.targets.ref)
+            max_tgt = float(res.parts.targets.ref.abs().max())
+            f_tgt = res.parts.x_t - res.interval * res.parts.targets.ref
+            u_recovered = (res.parts.x_t - f_tgt) / res.interval
+            d_recover = rel_diff(u_recovered, res.parts.targets.ref)
             report(f'[{name}] state conversion preserves clamped target',
-                   max_tgt <= float(loss_v.cfg.clamp_utgt) + 1e-6 and d_recover < TOL_FP32,
+                   max_tgt <= float(res.loss_v.cfg.clamp_utgt) + 1e-6 and d_recover < TOL_FP32,
                    f'max |u_tgt| = {max_tgt:.4f}, recover rel diff = {d_recover:.3e}')
-        assert_finite(f'[{name}] losses/preds', out_v['total'], out_s['total'], pred_v, pred_s)
-    return
+
+
+# ---------------------------------------------------------------------------
+# E. Realistic branch-combination tests (alpha=0 + CFG, alpha=1 skip, JVP no clipping,
+#    ratio_fm=0/1 boundaries).
+# ---------------------------------------------------------------------------
+
+def section_e_combinations(net_v, net_s, cfg, device):
+    print('\n=== E. Real branch-combination matrix ===')
+    b = 6
+    cond = net_v.construct_dummy_cond(b, device)
+
+    # E1: alpha=0 (JVP) + CFG guidance active.
+    res = run_case(cfg, net_v, net_s, cond, device, 'alpha0',
+                   {'cfg_params': EasyDict(omega=0.8, kappa=0.2, t_min=0.0, t_max=1.0)})
+    report_case_equivalence('alpha=0 + CFG', res)
+    d_guided = rel_diff(res.parts.velocity_cfg, res.parts.velocity)
+    jvp_samples = int(((res.batch.dt.flatten() == 0) & (~res.is_fm)).sum())
+    report('[alpha=0 + CFG] guidance active and JVP branch present',
+           d_guided > TOL_DIFF and jvp_samples > 0,
+           f'guidance rel diff = {d_guided:.3e}, JVP samples = {jvp_samples}/{b}')
+
+    # E2: alpha=1 -> target branch is skipped (`u_tgt == clip(velocity_cfg)`), state converts to z_r.
+    res = run_case(cfg, net_v, net_s, cond, device, 'alpha1')
+    report_case_equivalence('alpha=1 target skip', res)
+    clamp = float(res.loss_v.cfg.clamp_utgt)
+    clipped_v = torch.clip(res.parts.velocity_cfg, -clamp, clamp)
+    d_skip = rel_diff(res.parts.targets.ref, clipped_v)
+    report('[alpha=1 target skip] target == clip(velocity_cfg) (target branch skipped)', d_skip < TOL_FP32,
+           f'max rel diff = {d_skip:.3e}')
+    # The state target is then f_tgt = z_t-(t-r)u_tgt = z_r (true endpoint state, no target net call).
+    f_tgt = res.parts.x_t - res.interval * res.parts.targets.ref
+    d_state = rel_diff(f_tgt, res.parts.x_t - res.interval * clipped_v)
+    report('[alpha=1 target skip] state target f_tgt == z_t-(t-r)clip(velocity_cfg)', d_state < TOL_FP32,
+           f'max rel diff = {d_state:.3e}')
+
+    # E3: clipping semantics: c-branch (FM / JVP) is NOT clipped; d-branch IS clipped in velocity space.
+    batch = make_batch(net_v, device, 'mixed')
+    loss_small = build_loss(cfg, device, 'velocity', clamp_utgt=0.05)
+    loss_large = build_loss(cfg, device, 'velocity', clamp_utgt=4.0)
+    parts_small = reference_parts(loss_small, net_v, batch, cond)
+    parts_large = reference_parts(loss_large, net_v, batch, cond)
+    mask_c = (batch.dt == 0).flatten()
+    mask_d = ~mask_c
+    d_c = rel_diff(parts_small.targets.ref[mask_c], parts_large.targets.ref[mask_c]) if mask_c.any() else 0.0
+    max_c = float(parts_large.targets.ref[mask_c].abs().max()) if mask_c.any() else 0.0
+    report('[clipping semantics] c-branch (FM + JVP) targets are NOT clipped',
+           d_c < TOL_FP32 and max_c > 0.05,
+           f'clamp 0.05 vs 4.0 rel diff = {d_c:.3e}, max |u_tgt|(c) = {max_c:.4f} (exceeds clamp, not clipped)')
+    if mask_d.any():
+        d_d = rel_diff(parts_small.targets.ref[mask_d], parts_large.targets.ref[mask_d])
+        max_d = float(parts_large.targets.ref[mask_d].abs().max())
+        report('[clipping semantics] d-branch targets ARE clipped to clamp_utgt', d_d > TOL_DIFF and max_d > 0.05,
+               f'rel diff = {d_d:.3e}, max |u_tgt|(d) = {max_d:.4f}')
+        report('[clipping semantics] clipped d-branch target obeys clamp bound',
+               float(parts_small.targets.ref[mask_d].abs().max()) <= 0.05 + 1e-6,
+               f'max |clip(u_tgt)| = {float(parts_small.targets.ref[mask_d].abs().max()):.4f}')
+
+    # E4: ratio_fm = 0 boundary (all samples on the MF/consistency branch).
+    for kind, label in (('d_all', 'ratio_fm=0 (all MF, alpha>0)'), ('alpha0_all', 'ratio_fm=0 (all MF, alpha=0/JVP)')):
+        res = run_case(cfg, net_v, net_s, cond, device, kind)
+        report_case_equivalence(label, res)
+        report(f'[{label}] batch has no FM samples (as intended)', bool((~res.is_fm).all()))
+
+    # E5: ratio_fm = 1 boundary (all samples on the FM branch).
+    res = run_case(cfg, net_v, net_s, cond, device, 'fm')
+    report_case_equivalence('ratio_fm=1 (all FM)', res)
+    report('[ratio_fm=1 (all FM)] batch has no MF samples (state head unused in forward; see docs for DDP note)',
+           bool(res.is_fm.all()))
+
+    # ratio_fm=1 with CFG: guidance is only used for the target velocity of the FM branch.
+    res = run_case(cfg, net_v, net_s, cond, device, 'fm',
+                   {'cfg_params': EasyDict(omega=0.8, kappa=0.2, t_min=0.0, t_max=1.0)})
+    report_case_equivalence('ratio_fm=1 + CFG', res)
+    d_guided = rel_diff(res.parts.velocity_cfg, res.parts.velocity)
+    report('[ratio_fm=1 + CFG] guidance active on FM targets', d_guided > TOL_DIFF,
+           f'guidance rel diff = {d_guided:.3e}')
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +875,10 @@ def main():
 
     section_a_alignment(net_v, net_s, loss_v, loss_s, device)
     section_b_branches(net_v, net_s, cfg, device)
+    section_c0_full_mapping(net_s, device)
     section_c_gradients(net_v, net_s, cfg, device)
     section_d_sampling(net_v, net_s, cfg, device)
+    section_e_combinations(net_v, net_s, cfg, device)
 
     print()
     failed = [name for name, ok, _ in RESULTS if not ok]

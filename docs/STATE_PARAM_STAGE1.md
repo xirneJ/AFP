@@ -183,6 +183,46 @@ loss_i   = weight_i * L_i / (L_i.detach() + adaptive_loss_weight_eps)   # eps = 
   不能把函数等价直接写成"参数梯度相同"。
 - 采样等价（D 组）属于**函数/数值**层面的等价，不涉及梯度。
 
+### 2.2 全网络输出层面的映射（preconditioning / skip / adaIN）
+
+`f_state == z_t - (t-r)·u_velocity` 的成立**不只是"最后一层权重取负"**，而是完整网络输出层面的
+恒等式，来自以下代码路径（`src/training/networks.py` `Diffusion._construct_input/_forward` +
+`src/training/dit.py` `FinalLayer`）：
+
+| 环节 | velocity 路径 | state 路径 |
+| --- | --- | --- |
+| precond `alphaflow` 的 `c_in` | 1 | 1（相同 → 送入 backbone 的输入**逐位相同**） |
+| backbone 输入 | `c_in·z_t = z_t` | `c_in·z_t = z_t` |
+| 共享 trunk / 时间嵌入 / cond | 相同 | 相同 |
+| `FinalLayer.norm_final` + `adaLN_modulation` | 同一模块、同一份 scale/shift 特征 | 同左（**共享**，只有输出 linear 不同） |
+| 输出头 | `raw_v`（velocity 头） | `raw_s`（state 头，初始化为 `-`velocity 头，含 bias） |
+| `c_skip` / `x_skip` | `None`（无 skip） | `1.0·z_t` |
+| `c_out` | `1` | `t-r`（代码中 `noise_labels_next = t-r`） |
+| 最终输出 | `u = raw_v` | `f = z_t + (t-r)·raw_s` |
+
+因此，当且仅当 **`raw_s = -raw_v`（在完整头输出上取负，权重与 bias 都取负）** 时：
+
+```
+f_state(z_t,r,t) = z_t + (t-r)·(-raw_v) = z_t - (t-r)·u_velocity(z_t,r,t)     (精确成立)
+```
+
+**重要限定（阶段一的准确表述）**：
+
+- 该等式的成立条件是"两个头互为负拷贝 + 同一 trunk/输入"。我们在
+  `init_state_head_from_velocity_()` 里精确构造这个状态（新建模型；或加载 released ckpt 后
+  从**已加载的 velocity 头**取负初始化 state 头）。
+- 所以它**只在初始化点（训练第 0 步）成立**（以及每次从 velocity checkpoint 重新初始化时成立）。
+- **训练开始后不成立**：dual-head 模型里 velocity 头只从 FM 分支拿梯度、state 头只从一致性
+  分支拿梯度，两个头是独立参数，训练后不再互为负拷贝；此时
+  `u_velocity(z_t,r,t) ≠ (z_t - f_state)/(t-r)`，不能用 velocity 头反推 state 头。
+- 验证套件 C0 组会：① 用 forward hook 证明两个头收到的 backbone 输入与 FinalLayer 的
+  norm/adaLN 特征**逐位相同**；② 证明 `raw_s == -raw_v`、`f == z_t+(t-r)raw_s`、
+  `f == z_t-(t-r)u`；③ 做**反证测试**：只扰动 state 头权重，等式必须失效（证明这不是架构
+  自动性质，而是初始化等价）；④ 覆盖 `r=t` 退化情形（state 头因 `c_out=0` 输出 `z_t`，
+  FM 分支不使用 state 头）。
+- 在 bf16 autocast 下该等式在 IEEE 对称舍入意义下仍逐位成立（两套头计算对称）；验证脚本在
+  fp32 下以 `1e-5` 相对误差容限检查。
+
 ---
 
 ## 3. 验证报告 Part I — 数学 / 数值 / 代码等价性（硬性容限）
@@ -195,12 +235,15 @@ net_v 的 velocity 头取负），执行 A–D 四组检查（fp32、确定性�
 | 检查 | 容限 |
 | --- | --- |
 | 预测转换 `f == z-(t-r)u`（含极小间隔） | max rel diff < 1e-5 |
+| **C0 全网络映射**：backbone 输入 / FinalLayer 特征逐位相同（`torch.equal`），`raw_s == -raw_v`、`f == z+(t-r)raw_s`、`f == z-(t-r)u` | 前两项必须精确相等；其余 max rel diff < 1e-5 |
+| **C0 反证**：只扰动 state 头后等式失效 | 必须 > 1e-3（证明"仅初始化等价"） |
 | 未加权 loss `L_s == L_v`（d/JVP/FM 三分支） | max rel diff < 1e-5 |
 | adaptive 权重 / 最终 loss | weight < 1e-5；loss < 1e-3 |
 | 输出梯度 `dL_s/du == dL_v/du` | max rel diff < 1e-5 |
 | trunk 参数梯度（取负初始化点） | rtol 1e-4 / atol 1e-6 |
 | head 参数梯度镜像关系 `g_s == -g_v` | rtol 1e-4 / atol 1e-6 |
 | 采样：**每一步中间状态** + 最终状态（NFE-1/2，含 CFG） | max rel diff < 1e-4 |
+| **E 组真实分支组合**：`α=0 + CFG`、`α=1` 跳过目标分支、JVP 不裁剪、`ratio_fm=0/1`（含 CFG） | 同上的 loss/权重/梯度容限；外加分支语义断言（见 §3-E） |
 | 所有分支的 loss / pred / grad | 有限（无 NaN/Inf），无除零 |
 
 ### A. Batch 对齐审计（三版本对照）
@@ -234,12 +277,34 @@ state == velocity；以及 legacy 与 corrected 的差异。
 - adaptive 分母 detach 验证（`d(loss)/dL == w.detach()`）；
 - NaN/Inf/除零检查（各分支 + 极小间隔）。
 
+### C0. 全网络输出映射（preconditioning / skip / adaIN 层面）
+
+- 用 forward hook 捕获并证明：两个头收到的 **backbone 输入逐位相同**、
+  `FinalLayer.norm_final + adaLN_modulation` 产出的**特征逐位相同**；
+- `raw_state == -raw_velocity`（完整头输出取负，含 bias）；
+- `f == z_t + (t-r)·raw_state`（state precond：`c_skip=1, c_out=t-r, c_in=1`）；
+- `f == z_t - (t-r)·u`（完整网络输出层面的目标等式）；
+- 多组 `(t, r)`；`r=t` 退化情形验证 state 头以断言拒绝零区间（生产路径在 FM 分支使用
+  velocity 头，不调用 state 头）；
+- **反证**：只扰动 state 头权重 → 等式必须失效，证明它只是**初始化等价**而非架构性质。
+
 ### D. 采样等价（不额外增加 NFE，**逐步骤比较**）
 
 - NFE-1、NFE-2、NFE-1+CFG(2.0)、NFE-2+CFG(1.5)：
   对**每一步**都比较 `x_next`（中间状态）与 `x_denoised`，而不只比较最终结果；
 - 再检查最终生成状态；
 - NFE-1 state 输出 == 解析结果 `z_1 - u(z_1,0,1)`。
+
+### E. 真实训练分支组合矩阵
+
+- `α=0`（JVP 分支）**+ CFG**：`omega=0.8, kappa=0.2`，检查 guidance 生效、JVP 样本存在，
+  且 State/Velocity loss、权重、最终 loss 逐项一致；
+- `α=1` **目标分支跳过**：验证代码走 `u_tgt == clip(velocity_cfg)` 的跳过路径
+  （state 目标 `f_tgt = z_t-(t-r)u_tgt` 同样成立）；
+- **JVP 分支不裁剪**：用 `clamp_utgt=0.05 vs 4.0` 对比，c 分支（FM + JVP）目标完全一致
+  （不裁剪、可超过 clamp），d 分支目标被裁剪且满足 clamp 上界；
+- **`ratio_fm=0` 边界**：全 MF（`α>0` 的 d 分支；`α=0` 的 JVP 分支）两种子情形；
+- **`ratio_fm=1` 边界**：全 FM（无 MF 样本），并测 `ratio_fm=1 + CFG`。
 
 运行（服务器仓库根目录）：
 
@@ -249,7 +314,8 @@ git pull
 python scripts/check_state_equivalence.py
 ```
 
-期望末尾：`RESULT: ALL <N> CHECKS PASSED`（FAILED 时列出具体失败项与数值差异）。
+期望末尾：`RESULT: ALL <N> CHECKS PASSED`（FAILED 时列出具体失败项与数值差异；所有比较都会打印
+max rel diff / max abs diff）。
 
 > 说明：由于 dual-head 方案本身多了一个输出头，**训练动力学**与单头 velocity 模型不是
 > 逐参数完全相同（state 头只从一致性分支拿梯度，velocity 头只从 FM 分支拿梯度）；
@@ -336,8 +402,17 @@ python scripts/summarize_stage1_sanity.py \
 
 ## 5. 已知限制 / 注意事项
 
-- `ratio_fm > 0` 是 state 模型的硬性要求（velocity 头必须被 FM 样本训练，否则目标分支与
-  CFG 的 `u(z_t,t,t)` 会失效；DDP 下 velocity 头无梯度还会触发 unused-parameter 报错）。
+- `f_state == z_t-(t-r)u_velocity` **只在初始化点精确成立**（新建模型，或从 velocity
+  checkpoint 取负初始化 state 头之后）。训练开始后两个头独立更新，该等式不再成立，
+  不能用于把训练后的 state 模型反解成 velocity 模型。它只作为"同函数初始化"的依据。
+- `ratio_fm` 的边界（E 组已测）：
+  - `ratio_fm=1`（全 FM）：state 头在 forward 中完全不被使用 → DDP 需要
+    `training.dp.ddp_find_unused_parameters=true`（单卡 null 策略无此问题）；
+  - `ratio_fm=0`（全 MF）：state 模型里 velocity 头只在 `no_grad` 的目标/CFG 构造中使用，
+    backward 无梯度 → 同样需要 `find_unused_parameters`；
+  - **官方 alphaflow/meanflow 配方 `ratio_fm=0.25~0.5`**，两个头都能拿到梯度，正常训练无需改动。
+- `ratio_fm > 0` 是 state 模型的推荐要求（velocity 头必须被 FM 样本训练，否则目标分支与
+  CFG 的 `u(z_t,t,t)` 会失效）。
 - α=0 分支仍依赖 JVP → 训练时仍需 `training.force_math_attention: true`（已配置）。
 - α<0 不支持（原版负权重 MSE 无意义）；训练范围保持 `0 < α <= 1`。
 - state 采样不增加 NFE；NFE-1 时输出直接就是 `z_0`。
