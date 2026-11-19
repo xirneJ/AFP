@@ -82,18 +82,24 @@ loss_i   = weight_i * L_i / (L_i.detach() + adaptive_loss_weight_eps)   # eps = 
 另外记录 `trajectory_FM = mean((pred - velocity_cfg)^2)`、
 `trajectory_consistency = mean(2*(velocity_cfg - u_tgt)*pred)`（decomposed logging，不反传）。
 
-### 1.7 代码里发现的两个实现事实（不是公式推测）
+### 1.7 代码里发现的三个实现事实（不是公式推测）
 
 1. **目标分支是共享参数 + stop-gradient**（`@torch.no_grad()` 直接调用同一个 `net`），
    官方实现里**没有** EMA teacher。EMA teacher 因此是阶段二的一个真实机制差异。
-2. **原版 loss 存在一个样本配对错位隐患**：原实现把目标按 `cat([mask_c 目标, mask_d 目标])`
-   重排，而预测是按原始 batch 顺序计算的；只有当 `mask_c` 恰好是 batch 前缀时二者才对齐。
-   正常 `0 < α <= 1` 时 `mask_c` 就是前缀（FM 样本在前），所以没问题；但当 α 被 clamp 到
-   **恰好 0** 时，部分 MF 样本进入 `mask_c` 且散布在 batch 尾部，`pred` 会与错误的
-   `u_tgt` 配对。α-Flow sigmoid 配方后期会命中（α < clamp_value 时被强制为 0）。
-   本阶段实现改为**按原始样本顺序回填目标**（`mean_velocity[mask_c] = ...`），
-   在 α > 0 时与原版逐位相同，只有 α=0 的样本行为被修正。velocity 基线与 state 版本
-   都使用修正后的对齐方式，保证对照公平。
+2. **batch 目标拼接与对齐**：原实现把目标按 `cat([c 目标, d 目标])` 重排，而预测按原始
+   batch 顺序计算；只有当 `mask_c` 是 batch 前缀（或全为 True）时才逐样本对应。
+   **进一步审计结论（修正早期判断）**：`alpha` 是**每步一个标量**，所以
+   `dt = alpha·(t-r)` 对同一 batch 的所有 MF 样本相同 → `mask_c` 只可能是
+   - `alpha > 0`：只有前缀 FM 样本 `dt=0` → `mask_c` 是前缀；
+   - `alpha == 0`：所有 MF 样本 `dt=0` → `mask_c` 为全 True。
+
+   因此**官方采样器能产生的任何 batch 上，原实现都是对齐的**，并不存在实际错配。
+   修正版按原始样本顺序回填目标（`mean_velocity[mask_c] = ...`）：在所有真实 batch 上与原版
+   **逐位一致**，只对"非均匀 dt 模式"（例如将来改成 per-sample alpha 调度）保持正确。
+   审计脚本用**人为构造的 interleaved mask** 证明：原版配对在该模式下错配，
+   修正版与"逐样本独立参考实现"一致；真实模式（fm / d / alpha0）下三版本结果相同。
+3. **`clamp_utgt` 的位置**：只在 d 分支、且只在**速度空间**裁剪；c 分支（FM + α=0 JVP）
+   不裁剪。state 转换必须保留该语义（先得到 `u_tgt` → 裁剪 → `f_tgt = z_t-(t-r)u_tgt`）。
 
 ---
 
@@ -131,17 +137,47 @@ loss_i   = weight_i * L_i / (L_i.detach() + adaptive_loss_weight_eps)   # eps = 
 
 ---
 
-## 3. 等价性检查（不训练、不需要数据/权重）
+## 3. 等价性验证套件（不训练、不需要数据/权重）
 
-`scripts/check_state_equivalence.py` 在小的 pixel-space SiT（registry 的 smoke preset，
-64×64，dummy dataset）上做 4 项检查（fp32，确定性）：
+`scripts/check_state_equivalence.py` 在小 pixel-space SiT（registry 的 smoke preset，64×64，
+dummy dataset）上建立**同一函数**的 velocity 模型与 state 模型（net_s 的 state 头 =
+net_v 的 velocity 头取负），然后执行四组检查（fp32、确定性、约 1 分钟）：
 
-1. **预测转换**：`f(z_t,r,t) == z_t - (t-r)·u(z_t,r,t)`（state 头初始化为 velocity 头取负）。
-2. **未归一化 loss**：`mean((f-f_tgt)^2/(t-r)^2) == mean((u-u_tgt)^2)`。
-3. **adaptive loss**：两边权重与最终 loss 相同。
-4. **梯度**：
-   - 共享 trunk 参数梯度完全相同；
-   - state 头梯度 == −velocity 头梯度（初始化时互为负拷贝）。
+### A. Batch 对齐审计（三版本对照）
+
+| 版本 | 实现 |
+| --- | --- |
+| Original Official | 测试脚本内的 legacy 参考：`cat([c 目标, d 目标])` 与预测原序配对 |
+| Corrected Velocity | 生产代码的 velocity 路径（按原始顺序回填目标） |
+| Corrected State | 生产代码的 state 路径（同上 + state 头） |
+
+对每个模式检查：逐样本目标 == "逐样本独立参考实现"；生产 loss == 参考 loss；
+state == velocity；以及 legacy 与 corrected 的差异。
+- 真实模式（`fm` / `d` / `alpha0`，对应官方采样器能产生的 mask）：三版本一致；
+- 对抗模式（`interleaved`、`prefix_suffix`，人为构造的非均匀 dt）：legacy 出现
+  样本错配（报告错配样本数），corrected 仍与逐样本参考一致。
+
+### B. 分支与公式等价（Velocity vs State）
+
+- `0 < alpha <= 1` 的 d 分支；
+- `alpha = 0` 的 JVP 局部展开分支；
+- `r = t` 的 FM 分支；
+- CFG-guided velocity（`omega=0.8, kappa=0.2`，并检查 guidance 确实改变了目标）；
+- `clamp_utgt=0.05`（检查裁剪生效、且 state 转换保留裁剪后的目标）；
+- adaptive weighting：未加权 loss、权重、detach 分母、最终 loss 逐项相等。
+
+### C. 数值与梯度
+
+- 逐样本预测转换（含 `t-r = 1e-3` 的极小间隔）；
+- 输出梯度（同一预测 u 下 `L_s(u) == L_v(u)` 且 `dL_s/du == dL_v/du`）；
+- 网络参数梯度：共享 trunk 完全相同、state 头梯度 == −velocity 头梯度、有限且非零；
+- adaptive 分母 detach 验证（`d(loss)/dL == w.detach()`）；
+- NaN/Inf/除零检查（各分支 + 极小间隔）。
+
+### D. 采样等价（不额外增加 NFE）
+
+- NFE-1、NFE-2、NFE-1+CFG(2.0)、NFE-2+CFG(1.5)：state 采样 == velocity 采样；
+- NFE-1 state 输出 == 解析结果 `z_1 - u(z_1,0,1)`。
 
 运行（服务器仓库根目录）：
 
@@ -151,18 +187,18 @@ git pull
 python scripts/check_state_equivalence.py
 ```
 
-期望输出末尾：`RESULT: ALL 4 CHECKS PASSED`。
+期望末尾：`RESULT: ALL <N> CHECKS PASSED`（FAILED 时列出具体失败项与数值差异）。
 
 > 说明：由于 dual-head 方案本身多了一个输出头，**训练动力学**与单头 velocity 模型不是
 > 逐参数完全相同（state 头只从一致性分支拿梯度，velocity 头只从 FM 分支拿梯度）；
-> 但“loss 值 / 每分支梯度 / trunk 梯度”在初始化点严格等价。这是阶段一“严格等价
-> 重参数化”的准确含义，也是后续消融要隔离的结构差异。
+> 但"loss 值 / 每分支梯度 / trunk 梯度 / 采样输出"在初始化点严格等价。
+> 这是阶段一"严格等价重参数化"的准确含义，也是后续消融要隔离的结构差异。
 
 ---
 
 ## 4. 阶段一之后的最小 sanity check（1–2k steps）
 
-先训 dummy pixel 版（几分钟，验证双头、state loss、采样都能跑通，不需要 ImageNet）：
+先训 dummy pixel 版（几分钟，验证双头、state loss、state 采样都能跑通，不需要 ImageNet）：
 
 ```bash
 # velocity 对照（官方参数化）
@@ -174,8 +210,10 @@ bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu \
   desc=stage1-smoke-state model.parameterization=state training.max_steps=1000
 ```
 
-看 `runs/stage1-smoke-{velocity,state}/log.txt` 中 `total` loss 曲线：两者应在起始
-**几乎重合**（同初始化、同 batch、同 loss 公式），随后因输出参数化/双头结构略有差异。
+看 `runs/stage1-smoke-{velocity,state}/log.txt` 中 `Loss/total` 曲线：两者应在起始
+**几乎重合**（同初始化、同 batch、同 loss 公式），随后因输出参数化/双头结构略有差异；
+同时记录 `Loss/trajectory_*`、`Grad/norm`、有无 NaN/Inf、以及最终生成样本
+（`runs/stage1-smoke-*/generate/` 或 log 中保存的图）。
 
 再在 latent B/2 上做 1–2k steps 微调（需要先把 `data/imagenet/train` 接好）：
 

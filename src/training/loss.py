@@ -574,12 +574,15 @@ class AlphaFlowLoss(RecFlowLoss):
         # Calculate u_tgt when 0 < alpha <= 1
         mean_velocity_d = self._compute_mean_velocity_d(x_t_d, velocity_cfg_d, t_next_d, t_d, dt_d, cond_d, augment_labels, net) # [b_d, t, c, h, w]
 
-        # NOTE: the original implementation concatenated [c-samples, d-samples] and compared it
-        # against predictions computed in the original batch order. That is only equivalent when
-        # `mask_c` is a *prefix* of the batch. It is not the case when alpha gets clamped to 0
-        # (then some mean-flow samples move into the c-branch and get scattered through the batch),
-        # which silently pairs predictions with wrong targets. We assemble the targets back into the
-        # original sample order instead (identical to the original behavior whenever mask_c is a prefix).
+        # NOTE on batch alignment. The official implementation concatenates the targets as
+        # `cat([c-branch targets, d-branch targets])` and compares them to predictions computed in
+        # the original batch order; that matches only when `mask_c` is a batch prefix. With the
+        # current sampler this always holds: `alpha` is a scalar per step, so `mask_c` is either a
+        # prefix (alpha > 0: only the FM samples have dt == 0) or the whole batch (alpha == 0: all
+        # mean-flow samples also have dt == 0). We nevertheless assemble the targets back into the
+        # original sample order, which is bit-identical on every sampler-realizable batch and stays
+        # correct if a non-uniform dt pattern is ever introduced (e.g. per-sample alpha schedules).
+        # `scripts/check_state_equivalence.py` verifies this against a legacy reference.
         mean_velocity = torch.empty(x_t.shape, device=x_t.device, dtype=mean_velocity_d.dtype if batch_size_d > 0 else mean_velocity_c.dtype) # [b, t, c, h, w]
         if batch_size_c > 0:
             mean_velocity[mask_c] = mean_velocity_c # [b_c, t, c, h, w]
