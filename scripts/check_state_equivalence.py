@@ -489,7 +489,8 @@ def section_c0_full_mapping(net_s, device):
     w_s, b_s = final_layer.linear_state.weight, final_layer.linear_state.bias
     exact_negation = bool(torch.equal(w_s, -w_v) and torch.equal(b_s, -b_v))
     report('head parameters are exact negations (W_s == -W_v, b_s == -b_v)', exact_negation,
-           f'max |W_s+W_v|={float((w_s + w_v).abs().max()):.3e}, max |b_s+b_v|={float((b_s + b_v).abs().max()):.3e}')
+           f'max |W_s+W_v|={float((w_s + w_v).detach().abs().max()):.3e}, '
+           f'max |b_s+b_v|={float((b_s + b_v).detach().abs().max()):.3e}')
     shared_modulation = (final_layer.linear is not final_layer.linear_state) and \
                         hasattr(final_layer, 'adaLN_modulation') and hasattr(final_layer, 'norm_final')
     report('heads live in the same FinalLayer (adaLN modulation + norm_final are applied once, '
@@ -745,9 +746,10 @@ def section_c_gradients(net_v, net_s, cfg, device):
     report('output gradients: dL_s/du == dL_v/du (same prediction)', d < TOL_FP32, f'max rel diff = {d:.3e}')
 
     # C3. Adaptive-weight denominator is detached.
+    # With loss = sum_i w_i L_i and w_i = c/(L_i.detach()+eps), d(loss)/dL_i == w_i exactly.
     L_leaf = (torch.randn(b, device=device).abs() + 0.1).requires_grad_(True)
     c = 0.5
-    loss_detached = (c / (L_leaf.detach() + eps) * L_leaf).mean()
+    loss_detached = (c / (L_leaf.detach() + eps) * L_leaf).sum()
     g = torch.autograd.grad(loss_detached, L_leaf)[0]
     expected = c / (L_leaf.detach() + eps)
     d = rel_diff(g, expected)
@@ -825,8 +827,10 @@ def section_d_sampling(net_v, net_s, cfg, device):
         for t_cur, t_next in pairs:
             x, x_denoised, _ = reverse_recflow_step(
                 net=net, sampling_cfg=sampling_cfg, x_cur=x,
-                t_cur=torch.full((b,), float(t_cur), device=device),
-                t_next=torch.full((b,), float(t_next), device=device),
+                # Real sampler passes per-sample t as [b, 1, 1, 1, 1]; broadcasting with a [b]
+                # tensor would align the batch dimension with the last spatial dim.
+                t_cur=torch.full((b, 1, 1, 1, 1), float(t_cur), device=device),
+                t_next=torch.full((b, 1, 1, 1, 1), float(t_next), device=device),
                 sc_latents=None, dtype=torch.float32,
             )
             trajectory.append(EasyDict(x_next=x.clone(), x_denoised=x_denoised.clone()))
@@ -861,7 +865,8 @@ def section_d_sampling(net_v, net_s, cfg, device):
     with torch.no_grad():
         out_s, _, _ = reverse_recflow_step(
             net=net_s, sampling_cfg=sampling_cfg, x_cur=z,
-            t_cur=torch.full((b,), 1.0, device=device), t_next=torch.zeros(b, device=device),
+            t_cur=torch.full((b, 1, 1, 1, 1), 1.0, device=device),
+            t_next=torch.zeros(b, 1, 1, 1, 1, device=device),
             sc_latents=None, dtype=torch.float32,
         )
         u = net_v(z, sigma=torch.ones(b, 1, 1, 1, 1, device=device), sigma_next=torch.zeros(b, 1, 1, 1, 1, device=device), cond=net_v.construct_dummy_cond(b, device))
