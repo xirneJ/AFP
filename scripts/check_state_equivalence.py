@@ -1159,7 +1159,7 @@ def main():
             print(f'  - {name}')
         return 1
     print(f'RESULT: ALL {len(RESULTS)} CHECKS PASSED')
-    print('Stage 1 (verified state parameterization) is ready for the 1-2k step sanity check.')
+    print('Stage 1 (state parameterization) and Stage 2 F-group (EMA target teacher) are verified.')
     return 0
 
 

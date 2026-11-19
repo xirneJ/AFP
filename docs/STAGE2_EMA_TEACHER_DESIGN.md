@@ -1,9 +1,8 @@
 # Stage 2 设计文档：State + EMA Teacher（A2）
 
-> 状态：**设计阶段**，未实现。等审核通过后才写代码。
-> 原则：A2 相对 A1 **只改目标分支的来源**（student shared-stop-grad → EMA teacher），
-> 不同时引入任何其他机制（loss 公式、加权、α 调度、CFG、clamp、采样、评估协议全部不变）。
-> 本轮不启动 EMA 训练、不引入 Nested Consistency。
+> 状态：**已实现，F 组 216/216 通过**（见 [STAGE2_EMA_IMPLEMENTATION.md](STAGE2_EMA_IMPLEMENTATION.md)）。
+> 训练尚未启动，等待审核批准。实现遵循本设计：A2 相对 A1 **只改目标分支的来源**
+> （student shared-stop-grad → EMA teacher），不同时引入任何其他机制。
 
 ---
 

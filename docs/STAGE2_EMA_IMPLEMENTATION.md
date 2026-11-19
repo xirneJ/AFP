@@ -97,7 +97,33 @@ git pull
 python scripts/check_state_equivalence.py
 ```
 
-期望末尾：`RESULT: ALL <N> CHECKS PASSED`（约为 173 + 43 = 216 项；FAIL 会打印数值差异与名称）。
+期望末尾：`RESULT: ALL <N> CHECKS PASSED`（FAIL 会打印数值差异与名称）。
+
+### 实测结果（服务器 RTX 5090，commit `c949bd0`）
+
+```
+RESULT: ALL 216 CHECKS PASSED      （173 项 Stage-1 A–E 回归 + 43 项 F）
+```
+
+| 检查 | 实测 |
+| --- | --- |
+| F1 初始化逐位一致 / frozen | params_equal=True, buffers_equal=True；eval + requires_grad=False |
+| F2 A1/A2 target & loss（7 种模式） | 全部 **0.000e+00**；teacher 调用数：d=1、α=0=1、mixed=2、d_all=1、α0_all=1、fm=0、α=1=0 |
+| F3 student 梯度一致 / teacher 无梯度 | 35 tensors，max abs diff **5.588e-09**；teacher grads = none |
+| F4 optimizer 隔离 | teacher 参数不在 optimizer；`init_optimizers` 只用 `nets.net` |
+| F5 decay / lerp / rampup / 时序 | β=0.999899998193 与公式一致；lerp max abs err **7.451e-09**；rampup step=10 → β=0.25；源码顺序 `optimizer.step()` 在 teacher 更新之前，且使用 `cur_step % ema_update_freq` |
+| F6 α=0 JVP 非混合 | teacher-JVP 与 student-JVP 显著不同（rel diff 1.573e+03）；"teacher 基础 + student JVP"混合量与 A2 不重合（0.782e-04 < 1e-3 容限） |
+| F7 CFG cond+uncond 均走 teacher | teacher-guided velocity 与 student-guided 显著不同（3.383e+03）；teacher forward 次数 = **3**（uncond + cond + u⁻） |
+| F8 α=1 / FM 不误调 teacher | forward 次数 = **0** / **0** |
+| F9 checkpoint 往返 | teacher state 保存→加载逐位一致；save/load 源码含 teacher 字段 |
+| F10 eval EMA 与 target EMA 分离 | 两模块独立；teacher 更新不改 eval EMA；扰动 eval EMA 对 A2 loss 影响 **0.000e+00**；快照三状态互异（max \|ema−teacher\|=5.268e-02） |
+
+同时 A–E 组 173 项的数值与 Stage 1 验收时逐项一致（例如 A 组 realizable target rel diff 0.0、
+C0 全网络映射 0.0、D 组逐步骤采样 0.0、E 组分支组合 ≤2.4e-07），说明默认 `target_branch=shared`
+完全保持了 A0/A1 的既有行为。
+
+结论：EMA teacher 的实现（含 teacher 创建/更新/保存/恢复、目标分支切换、JVP/CFG/α=1/FM 分支语义、
+评估 EMA 与 target EMA 分离）已通过全部静态与数值验证。**尚未进行任何 A2 训练。**
 
 ---
 
