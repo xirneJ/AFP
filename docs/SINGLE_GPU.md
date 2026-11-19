@@ -260,24 +260,45 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
 
 ---
 
-## 6. 评测（生成 + FID）
+## 6. 评测（生成 + FID / FDD / FCD）
 
-训练过程中会自动算 FID；也可以单独评测：
+以“训练好的 checkpoint → 生成 50k → 算指标”为例。checkpoint 文件名是 **8 位步数**，
+例如第 400000 步是 `snapshot-00400000.pt`（`ls output/<实验名>/` 看实际名字）。
 
 ```bash
-# 1) 先按第 3 步用训练好的 checkpoint 生成 50k 张（分批跑，可以多次续跑）
-CKPT=output/alphaflow-sigmoid-latentspace-B-2-single-gpu/snapshot-0400000.pt \
-OUT=data/generate/my-B-2 SEEDS=0-49999 BATCH_SIZE=4 \
-  bash scripts/generate_single_gpu.sh
+# 1) 生成 50k 张（按 5000 一组分批，中断了只重跑对应分段；文件名按 seed，不会冲突）
+CKPT=output/alphaflow-sigmoid-latentspace-B-2-single-gpu/snapshot-00400000.pt
+OUT=data/generate/alphaflow-b2-nfe1
+for s in 0 5000 10000 15000 20000 25000 30000 35000 40000 45000; do
+  e=$((s + 4999))
+  CKPT="$CKPT" OUT="$OUT" SEEDS="$s-$e" NFE=1 BATCH_SIZE=8 \
+    bash scripts/generate_single_gpu.sh || break
+done
 
-# 2) 对生成目录算 FID / FDD / FCD
+# 2) 算指标。注意：
+#    - dataset.use_val_data_for_eval_stream=true -> FID 的“真实分布”用 ImageNet val 50k
+#      （标准 FID 协议，单卡约 10-20 分钟/个 detector；默认 false 会用 1.28M 训练图，非常慢）
+#    - gen_dataset.* 指向刚生成的目录
 python scripts/evaluate.py \
-  dataset.resolution=[1,256,256] \
-  gen_dataset.src=data/generate/my-B-2/ gen_dataset.resolution=[1,256,256] gen_dataset.label_shape=[] \
-  metrics=[fid50k_full]
+  'dataset.resolution=[1,256,256]' \
+  dataset.use_val_data_for_eval_stream=true \
+  'gen_dataset.src=data/generate/alphaflow-b2-nfe1/' \
+  'gen_dataset.resolution=[1,256,256]' \
+  'gen_dataset.label_shape=[]' \
+  'metrics=[fid50k_full,dinofid50k_full,fcd50k_full]'
 ```
 
-第一次算 FID 需要先统计真实数据特征，会缓存到 `data/stats/`，之后就是增量加载。
+- `fid50k_full` = FID（Inception），最优先；`dinofid50k_full` = 论文里的 FDD（DINOv2 特征）；
+  `fcd50k_full` = FCD（CLIP 特征，需要额外 `pip install git+https://github.com/openai/CLIP.git`）。
+- 第一次运行会下载 detector 权重（Inception / DINOv2 / CLIP）并把**真实数据特征**缓存到
+  `data/stats/`，之后的变体评测直接复用，只算生成数据的特征。
+- **公平对比**：所有变体用同一个 step、同一 NFE、同一套采样参数（默认
+  `sampling.sigma_noise=1 sampling.cfg.scale=1.0 sampling.enable_trajectory_sampling=true`），
+  生成时 seed 范围一致（0-49999）。
+- NFE-2 的指标：把上面 `NFE=1` 改成 `NFE=2`、输出目录换个名字（如 `...-nfe2`）再跑一遍即可。
+
+> 磁盘：50k 张 256×256 PNG 约 10–15 GiB/个目录，先 `df -h ~` 确认空间。
+> 训练过程中的 FID-2048 只看趋势，最终对照用这里的 50k FID。
 
 ---
 
