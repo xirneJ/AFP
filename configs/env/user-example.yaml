@@ -1,10 +1,11 @@
 # This file contains custom settings for a user and is not supposed to be committed to the repository.
 user: hzhang11
 project_path: <your/project/path> # TODO: make `project_path: ${hydra:runtime.cwd}` work in the initialize + compose setting
+experiments_root: ${env.project_path}/runs # Single root for ALL experiment artifacts (runs/<desc>/{log.txt,snapshots,generate,metrics}).
 folder_datasets_path: ${env.project_path}/data # Where the non-sharded datasets are located locally.
 cache_dir: ${env.project_path}/.cache # Where to store cache for model weights for clip/huggingface/lpips/etc.
-dataset_stats_dir: ${env.project_path}/data/stats # Where the dataset statistics for FID/FVD are stored. Copy them for initialization.
-latents_stats_dir: ${env.project_path}/data/latents-stats # Where the latent statistics are computed.
+dataset_stats_dir: ${env.experiments_root}/_dataset_stats # Where the dataset statistics for FID/FVD are stored. Copy them for initialization.
+latents_stats_dir: ${env.experiments_root}/_latents_stats # Where the latent statistics are computed.
 
 # A path to the installed conda environment directory.
 conda_env_dirname: env

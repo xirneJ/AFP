@@ -93,8 +93,38 @@ pip install -r requirements-blackwell.txt
 > 你的 venv 放在哪里都可以：单卡入口脚本用的是**当前已激活的 `python`**，
 > 只要 `source` 过对应 venv 就行。`configs/env/user.yaml` 里的 `project_path`
 > 由 `ALPHAFLOW_PROJECT_PATH` 环境变量提供，入口脚本会自动设成仓库根目录，
-> 所以不需要手改路径。若要把 data/snapshots/output 放到别的盘，先
+> 所以不需要手改路径。若要把 data/snapshots 放到别的盘，先
 > `export ALPHAFLOW_PROJECT_PATH=/your/path` 再运行。
+
+---
+
+## 1.5 所有实验产物统一放在 `runs/` 下
+
+`configs/env/user.yaml` 里的 `experiments_root`（默认 `<仓库根目录>/runs`）是**唯一**的
+实验产物目录，所有脚本都会写到这里，不会散落在别处：
+
+```
+runs/
+├── <run_name>/                     # 一次训练 = 一个 run（run_name 由 desc=... 指定）
+│   ├── log.txt                     # 训练日志（自动写入）
+│   ├── snapshot-XXXXXXXX.pt        # 8 位步数的 checkpoint（断点续训也在这里找）
+│   ├── metric-*.jsonl              # 训练中 FID 等指标历史
+│   ├── fakes_*.png / real_*.png    # 训练中可视化样本
+│   ├── generate/
+│   │   └── nfe1/ nfe2/             # 从该 run 的 checkpoint 生成的 50k 图片
+│   └── metrics/
+│       ├── eval-nfe1.json          # 最终评测汇总（FID/FDD/FCD）
+│       └── metric-fid50k_full.jsonl
+├── _released/
+│   └── <ckpt名>/
+│       ├── nfe1/ nfe2/             # 官方发布权重的生成结果
+│       └── metrics/                # 对应的评测结果
+└── _dataset_stats/                 # FID 真实数据特征缓存（所有 run 共享，首次生成后复用）
+```
+
+- 想改存放位置：改 `configs/env/user.yaml` 的 `experiments_root` 一行即可
+  （生成脚本默认仍用 `<仓库>/runs`，改过目录后生成时显式传 `OUT=<新目录>/...`）。
+- 所有路径都在 `.gitignore` 里，不会被误提交。
 
 ---
 
@@ -137,11 +167,11 @@ NFE=2 SEEDS=0-31 BATCH_SIZE=2 bash scripts/generate_single_gpu.sh
 DIT_DTYPE=bfloat16 bash scripts/generate_single_gpu.sh
 ```
 
-输出在 `data/generate/alphaflow-B-2-cfg-NFE1/`。
+输出在 `runs/_released/alphaflow-B-2-cfg/nfe1/`（官方权重的生成结果统一放 `_released/`）。
 
 常见问题：
 
-* **OOM**：先 `DIT_DTYPE=bfloat16 BATCH_SIZE=1`；还是不行就等显存。
+* **OOM**：先 `DIT_DTYPE=bfloat16 BATCH_SIZE=1`；还是不行就等占显存的进程结束。
   脚本会打印 `Peak GPU memory ...`，可以据此判断实际占用。
 * **找不到 sd_vae**：把 `sd_vae_ft_ema.pt` 放到 `snapshots/`；加载时会自动把
   checkpoint 里记录的旧机器路径重定向到本地 `./snapshots/`。
@@ -157,8 +187,8 @@ bash scripts/train_single_gpu.sh alphaflow-smoke-test-single-gpu
 ```
 
 预期：打印模型结构 / 参数量 / batch 设置，训练 30 步，最后保存一个
-`output/alphaflow-smoke-test-single-gpu/snapshot-00000030.pt`（单卡 `direct_launch`
-模式下每个实验有独立输出目录 `output/<实验名>/`）。
+`runs/alphaflow-smoke-test-single-gpu/snapshot-00000030.pt`（单卡 `direct_launch`
+模式下每个实验有独立目录 `runs/<desc>/`，`desc` 默认等于实验名）。
 显存占用约 1–2 GiB，这也能让你先测出**你这块卡上每步大概多少秒**。
 
 latent-space（VAE + DiT）链路的 smoke test（需要 sd_vae 权重）：
@@ -168,7 +198,7 @@ bash scripts/train_single_gpu.sh alphaflow-smoke-test-ldm-single-gpu
 ```
 
 > 想从头重跑 smoke test：先删掉对应的输出目录，例如
-> `rm -rf output/alphaflow-smoke-test-single-gpu`（否则会自动从上次的
+> `rm -rf runs/alphaflow-smoke-test-single-gpu`（否则会自动从上次的
 > checkpoint 续跑，直接“秒结束”）。
 
 ---
@@ -242,8 +272,9 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
 #   python infra/launch.py <exp> num_gpus=1 direct_launch=true wandb.enabled=true
 ```
 
-训练输出在 `output/<实验名>/`（checkpoint、sample 图、日志）。**断点续训**：直接重新执行
-同一条命令即可，程序会自动从该目录里最新的 `snapshot-*.pt` 恢复。
+训练输出在 `runs/<desc>/`（`log.txt`、checkpoint、sample 图、训练中指标）。
+**断点续训**：直接重新执行同一条命令即可（同一个 `desc`），程序会自动从该目录里最新的
+`snapshot-*.pt` 恢复。用不同的 `desc=` 可以得到互不干扰的多次运行。
 
 ### 5.3 显存 / 速度参考
 
@@ -263,42 +294,45 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
 ## 6. 评测（生成 + FID / FDD / FCD）
 
 以“训练好的 checkpoint → 生成 50k → 算指标”为例。checkpoint 文件名是 **8 位步数**，
-例如第 400000 步是 `snapshot-00400000.pt`（`ls output/<实验名>/` 看实际名字）。
+例如第 400000 步是 `snapshot-00400000.pt`（`ls runs/<desc>/` 看实际名字）。
 
 ```bash
-# 1) 生成 50k 张（按 5000 一组分批，中断了只重跑对应分段；文件名按 seed，不会冲突）
-CKPT=output/alphaflow-sigmoid-latentspace-B-2-single-gpu/snapshot-00400000.pt
-OUT=data/generate/alphaflow-b2-nfe1
+# 1) 生成 50k 张。只传 CKPT 即可：脚本会按规矩写进
+#    runs/<desc>/generate/nfe<NFE>/（官方权重则写 runs/_released/...）
+#    按 5000 一组分批，中断了只重跑对应分段；文件名按 seed，不会冲突。
+CKPT=runs/ft-alphaflow-base/snapshot-00020000.pt
 for s in 0 5000 10000 15000 20000 25000 30000 35000 40000 45000; do
   e=$((s + 4999))
-  CKPT="$CKPT" OUT="$OUT" SEEDS="$s-$e" NFE=1 BATCH_SIZE=8 \
+  CKPT="$CKPT" SEEDS="$s-$e" NFE=1 BATCH_SIZE=8 \
     bash scripts/generate_single_gpu.sh || break
 done
 
-# 2) 算指标。注意：
-#    - dataset.use_val_data_for_eval_stream=true -> FID 的“真实分布”用 ImageNet val 50k
-#      （标准 FID 协议，单卡约 10-20 分钟/个 detector；默认 false 会用 1.28M 训练图，非常慢）
-#    - gen_dataset.* 指向刚生成的目录
-python scripts/evaluate.py \
-  'dataset.resolution=[1,256,256]' \
-  dataset.use_val_data_for_eval_stream=true \
-  'gen_dataset.src=data/generate/alphaflow-b2-nfe1/' \
-  'gen_dataset.resolution=[1,256,256]' \
-  'gen_dataset.label_shape=[]' \
-  'metrics=[fid50k_full,dinofid50k_full,fcd50k_full]'
+# 2) 算指标（结果自动保存到 runs/<desc>/metrics/）
+bash scripts/evaluate_single_gpu.sh runs/ft-alphaflow-base/generate/nfe1
 ```
 
-- `fid50k_full` = FID（Inception），最优先；`dinofid50k_full` = 论文里的 FDD（DINOv2 特征）；
-  `fcd50k_full` = FCD（CLIP 特征，需要额外 `pip install git+https://github.com/openai/CLIP.git`）。
+`evaluate_single_gpu.sh` 默认：
+- `metrics=fid50k_full,dinofid50k_full,fcd50k_full`（可用 `METRICS=` 覆盖，建议先只跑 FID）；
+- 用 **ImageNet val 50k** 作为真实分布（标准 FID，`VAL_SPLIT=1` 默认）；
+- 把汇总写到 **生成目录所属 run 的 `metrics/`**：
+  `runs/<desc>/metrics/eval-nfe1.json`（官方权重则是 `runs/_released/<ckpt>/metrics/...`），
+  并追加 `metric-*.jsonl`；
 - 第一次运行会下载 detector 权重（Inception / DINOv2 / CLIP）并把**真实数据特征**缓存到
-  `data/stats/`，之后的变体评测直接复用，只算生成数据的特征。
-- **公平对比**：所有变体用同一个 step、同一 NFE、同一套采样参数（默认
-  `sampling.sigma_noise=1 sampling.cfg.scale=1.0 sampling.enable_trajectory_sampling=true`），
-  生成时 seed 范围一致（0-49999）。
-- NFE-2 的指标：把上面 `NFE=1` 改成 `NFE=2`、输出目录换个名字（如 `...-nfe2`）再跑一遍即可。
+  `runs/_dataset_stats/`，之后的变体评测直接复用，只算生成数据的特征。
+- `fcd50k_full` 需要先 `pip install git+https://github.com/openai/CLIP.git`。
+
+> 只有 val 数据时：`DATA_SRC=$PWD/data/imagenet/val/ bash scripts/evaluate_single_gpu.sh ...`
+> （训练集目录不存在时用它顶替真实数据来源）。
+>
+> 想和论文 `evaluate.sh` 的默认协议完全一致（真实分布用 1.28M 训练图，首次统计要几小时）：
+> `VAL_SPLIT=0 bash scripts/evaluate_single_gpu.sh <gen_dir>`。
+> **公平对比**：所有变体用同一个 step、同一 NFE、同一套采样参数
+> （默认 `sampling.sigma_noise=1 sampling.cfg.scale=1.0 sampling.enable_trajectory_sampling=true`），
+> 生成时 seed 范围一致（0-49999）。NFE-2 把 `NFE=2` 再跑一遍即可（输出到 `nfe2/`）。
 
 > 磁盘：50k 张 256×256 PNG 约 10–15 GiB/个目录，先 `df -h ~` 确认空间。
-> 训练过程中的 FID-2048 只看趋势，最终对照用这里的 50k FID。
+> 训练过程中的 FID-2048（写在 `runs/<desc>/metric-*.jsonl`）只看趋势，
+> 最终对照用这里的 50k FID。
 
 ---
 
@@ -329,7 +363,12 @@ A: 原始实验在 8×H100 上用 `torchrun` + FSDP/DDP，batch 256、400k~1.2M 
 
 **Q: `direct_launch=true` 是什么意思？**
 A: 不创建 `experiments/<id>-...` 目录、不拼 `torchrun` 命令，直接在当前仓库里调用
-`train(cfg)`；输出统一写到 `./output`。单卡实验都在注册表里设置好了。
+`train(cfg)`；所有实验产物统一写到 `runs/<desc>/`。单卡实验都在注册表里设置好了。
+
+**Q: 实验产物都存哪？**
+A: 全部在 `configs/env/user.yaml` 的 `experiments_root`（默认 `<仓库>/runs`）下：
+`runs/<desc>/`（训练/checkpoint/日志/训练中指标）、`runs/<desc>/generate/`（50k 生成图）、
+`runs/<desc>/metrics/`（最终 FID 结果）、`runs/_dataset_stats/`（真实数据特征缓存）。
 
 **Q: 报 `no kernel image is available for execution on the device`**
 A: torch 版本不对（不是 cu128）。重装第 1 步。
@@ -343,5 +382,5 @@ A: 需要联网或预先把模型放进 `$HF_HOME`（默认 `./.cache/huggingfac
 A: 直接第 2、3 步，1 张 256×256 图，NFE-1，几秒钟。
 
 **Q: 现在只有 2–3 GiB 空闲显存，能训练吗？**
-A: 不能。单卡 B/2 训练最低约 5–7 GiB（batch_gpu=8），且需要等别人的任务结束。
-推理可以做到 batch=1（见第 3 步的 `DIT_DTYPE=bfloat16`）。
+A: 不能。单卡 B/2 训练最低约 5–7 GiB（batch_gpu=8）；一般需要 ≥16 GiB 空闲才能用默认
+batch。推理可以做到 batch=1（见第 3 步的 `DIT_DTYPE=bfloat16`）。

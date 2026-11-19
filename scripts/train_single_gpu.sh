@@ -40,7 +40,8 @@ export TOKENIZERS_PARALLELISM=false
 EXP="${1:-alphaflow-smoke-test-single-gpu}"
 shift || true
 
-mkdir -p experiments data
+# All run artifacts (log.txt, snapshots, samples, metrics) go to runs/<desc>/.
+mkdir -p experiments data runs
 
 if [[ ! -f configs/env/user.yaml ]]; then
   echo "[ERROR] configs/env/user.yaml is missing."
@@ -50,6 +51,7 @@ fi
 echo "=============================================================="
 echo " Experiment : ${EXP}"
 echo " Repo       : ${REPO_ROOT}"
+echo " Output dir : ${REPO_ROOT}/runs/<desc>/   (desc=... override, defaults to the experiment name)"
 echo " Python     : $(command -v python) ($(python -c 'import sys; print(sys.version.split()[0])'))"
 echo " Extra args : $*"
 if command -v nvidia-smi >/dev/null 2>&1; then

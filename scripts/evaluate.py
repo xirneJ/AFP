@@ -1,6 +1,7 @@
 import os
 import pickle
 import sys
+import time
 
 # Make `import src...` / `import infra...` work no matter how this script is launched.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +24,40 @@ from src.data import Data
 from src.training.network_utils import load_snapshot
 from src.utils.autoencoder_utils import compute_autoencoder_stats, init_autoencoder_stats
 from infra.utils import dict_to_hydra_overrides, recursive_instantiate
+
+#----------------------------------------------------------------------------
+
+def infer_metrics_dir(cfg: EasyDict, gen_path) -> str:
+    """Returns the folder where evaluation results should be saved.
+
+    Everything is kept under the single configured experiments root:
+        runs/<run>/metrics/                    (checkpoint of a training run)
+        runs/_released/<ckpt_name>/metrics/    (released checkpoints)
+    Falls back to a `metrics/` folder next to the generated samples otherwise.
+    """
+    explicit = cfg.get('metrics_dir')
+    if explicit is not None:
+        return str(explicit)
+
+    gen_abs = os.path.abspath(str(gen_path).rstrip('/\\')) if gen_path is not None else None
+    env = cfg.get('env')
+    experiments_root = env.get('experiments_root') if env is not None else None
+    if experiments_root is not None and gen_abs is not None:
+        root_abs = os.path.abspath(str(experiments_root))
+        rel = os.path.relpath(gen_abs, root_abs)
+        if not rel.startswith('..'):
+            parts = [p for p in rel.split(os.sep) if p]
+            if 'generate' in parts:
+                # runs/<run>/generate/nfe1 -> runs/<run>/metrics
+                idx = len(parts) - 1 - parts[::-1].index('generate')
+                return os.path.join(root_abs, *parts[:idx], 'metrics')
+            if parts and parts[-1].startswith('nfe'):
+                # runs/_released/<ckpt>/nfe1 -> runs/_released/<ckpt>/metrics
+                return os.path.join(root_abs, *parts[:-1], 'metrics')
+            return os.path.join(root_abs, parts[0], 'metrics')
+    if gen_abs is not None:
+        return os.path.join(os.path.dirname(gen_abs), 'metrics')
+    return os.path.join(_REPO_ROOT, 'runs', '_metrics')
 
 #----------------------------------------------------------------------------
 
@@ -99,6 +134,13 @@ def evaluate(cfg: DictConfig):
     else:
             gen_path = snapshot_path
 
+    # All evaluation results are saved under the experiments root:
+    #   <env.experiments_root>/<run_name>/metrics/
+    metrics_dir = infer_metrics_dir(cfg, gen_path)
+    if dist.is_main_process():
+        os.makedirs(metrics_dir, exist_ok=True)
+        dist.loginfo0(f'Evaluation results will be saved to: {metrics_dir}')
+
     # Calculate each metric.
     results = {}
     for metric in cfg.metrics:
@@ -121,9 +163,22 @@ def evaluate(cfg: DictConfig):
         )
         results[metric] = result_dict
         if dist.is_main_process():
-            metric_main.report_metric(result_dict, run_dir=None, snapshot_path=snapshot_path, save_result=False)
+            result_dict['gen_path'] = gen_path
+            metric_main.report_metric(result_dict, run_dir=metrics_dir, snapshot_path=snapshot_path, save_result=True)
         if cfg.verbose:
             dist.print0()
+
+    if dist.is_main_process():
+        eval_tag = os.path.basename(str(gen_path).rstrip('/')) or 'eval'
+        combined_path = os.path.join(metrics_dir, f'eval-{eval_tag}.json')
+        save_json({
+            'gen_path': gen_path,
+            'snapshot_path': snapshot_path,
+            'metrics': EasyDict.init_recursively(results, target_class=dict),
+            'timestamp': time.time(),
+            'timestamp_str': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }, combined_path)
+        dist.loginfo0(f'Saved evaluation results to: {combined_path}')
 
     if cfg.save_path is not None and dist.is_main_process():
         os.makedirs(os.path.dirname(cfg.save_path), exist_ok=True)

@@ -10,6 +10,9 @@ defaults:
 verbose: true
 metrics: [fid50k_full,dinofid50k_full,fcd50k_full] # Quality metrics
 save_path: ~
+# Where to write results (json/jsonl). Default: <env.experiments_root>/<run_name>/metrics/
+# inferred from the generated dataset path. Override with e.g. metrics_dir=runs/my-run/metrics
+metrics_dir: ~
 
 has_raw_captions: false # Whether the gen dataset has raw captions.
 

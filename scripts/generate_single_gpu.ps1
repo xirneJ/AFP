@@ -11,7 +11,9 @@
 #
 # Environment variables (all optional):
 #   CKPT        checkpoint path           (default: snapshots\alphaflow-B-2-cfg.pt)
-#   OUT         output directory          (default: data\generate\alphaflow-B-2-cfg-NFE1)
+#   OUT         output directory          (default: runs\<run>\generate\nfe<NFE> when the
+#                                          checkpoint lives under runs\,
+#                                          else runs\_released\<ckpt>\nfe<NFE>)
 #   SEEDS       seeds to generate         (default: 0-7)
 #   NFE         number of sampling steps  (default: 1; use 2 for the 2-NFE variant)
 #   BATCH_SIZE  generation batch size     (default: 1; raise to 2-4 if VRAM allows)
@@ -41,10 +43,29 @@ $venvPy = Join-Path $repoRoot "venv\Scripts\python.exe"
 if (Test-Path $venvPy) { $python = $venvPy } else { $python = "python" }
 
 if (-not $env:CKPT) { $env:CKPT = "snapshots\alphaflow-B-2-cfg.pt" }
-if (-not $env:OUT) { $env:OUT = "data\generate\alphaflow-B-2-cfg-NFE1" }
 if (-not $env:SEEDS) { $env:SEEDS = "0-7" }
 if (-not $env:NFE) { $env:NFE = "1" }
 if (-not $env:BATCH_SIZE) { $env:BATCH_SIZE = "1" }
+
+# --- Where to write generated images (under the unified experiments root) ------
+#   * checkpoint inside <repo>\runs\<run>\...  ->  runs\<run>\generate\nfe<NFE>\
+#   * released checkpoint in .\snapshots\...    ->  runs\_released\<ckpt>\nfe<NFE>\
+# Override explicitly with $env:OUT.
+$experimentsRoot = Join-Path $repoRoot "runs"
+if (-not $env:OUT) {
+    $ckptName = [System.IO.Path]::GetFileNameWithoutExtension($env:CKPT)
+    $ckptDir = ""
+    if (Test-Path $env:CKPT) { $ckptDir = (Resolve-Path (Split-Path -Parent $env:CKPT)).Path }
+    if ($ckptDir -and $ckptDir.ToLower().StartsWith($experimentsRoot.ToLower())) {
+        $rel = $ckptDir.Substring($experimentsRoot.Length).TrimStart([char[]]@('\', '/'))
+        $runName = ($rel -split '[\\/]')[0]
+        if (-not $runName) { $runName = "_released" }
+        $env:OUT = Join-Path $experimentsRoot "$runName\generate\nfe$($env:NFE)"
+    } else {
+        $env:OUT = Join-Path $experimentsRoot "_released\$ckptName\nfe$($env:NFE)"
+    }
+}
+New-Item -ItemType Directory -Force -Path $env:OUT | Out-Null
 
 if (-not (Test-Path $env:CKPT)) {
     Write-Host "[ERROR] checkpoint not found: $($env:CKPT)"

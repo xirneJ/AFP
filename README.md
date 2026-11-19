@@ -54,6 +54,11 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu
 Full runbook (data preparation, VRAM/time estimates, evaluation, how to set up
 your own comparison experiments): **[docs/SINGLE_GPU.md](docs/SINGLE_GPU.md)**.
 
+All single-GPU experiment artifacts (training logs, checkpoints, in-training metrics,
+generated samples, final FID results, cached dataset statistics) are written under a
+single folder: `<repo>/runs/` (configurable via `experiments_root` in
+`configs/env/user.yaml`) — see the layout in `docs/SINGLE_GPU.md`.
+
 ### Windows (RTX 50-series laptop, PowerShell)
 
 The same single-GPU presets run natively on Windows (PyTorch cu128, gloo backend):

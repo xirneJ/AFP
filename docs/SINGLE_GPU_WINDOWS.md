@@ -97,7 +97,8 @@ $env:NFE="2"; $env:SEEDS="0-31"; $env:DIT_DTYPE="bfloat16"
 powershell -ExecutionPolicy Bypass -File scripts\generate_single_gpu.ps1
 ```
 
-输出在 `data\generate\alphaflow-B-2-cfg-NFE1\`。脚本会打印峰值显存。
+输出在 `runs\_released\alphaflow-B-2-cfg\nfe1\`（所有实验产物统一在仓库根目录的
+`runs\` 下：训练/生成/评测结果各有子目录）。脚本会打印峰值显存。
 
 **OOM 处理顺序**：`DIT_DTYPE=bfloat16` → `BATCH_SIZE=1` → 关掉浏览器/游戏/桌面动画再试。
 桌面本身约占 1–3 GiB，笔记本 8 GiB 卡要留余量。
@@ -112,11 +113,11 @@ powershell -ExecutionPolicy Bypass -File scripts\train_single_gpu.ps1 alphaflow-
 ```
 
 预期：打印模型结构/batch 设置，训练 30 步，最后在
-`output\alphaflow-smoke-test-single-gpu\snapshot-00000030.pt` 保存 checkpoint。
+`runs\alphaflow-smoke-test-single-gpu\snapshot-00000030.pt` 保存 checkpoint。
 重跑前先删输出目录（否则会从上次 checkpoint 续跑）：
 
 ```powershell
-Remove-Item -Recurse -Force output\alphaflow-smoke-test-single-gpu
+Remove-Item -Recurse -Force runs\alphaflow-smoke-test-single-gpu
 ```
 
 再测 latent-space（VAE + DiT）链路（需要第 3 步的 sd_vae 权重）：

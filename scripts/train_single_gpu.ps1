@@ -34,6 +34,7 @@ $env:TOKENIZERS_PARALLELISM = "false"
 
 New-Item -ItemType Directory -Force -Path (Join-Path $repoRoot "experiments") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $repoRoot "data") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $repoRoot "runs") | Out-Null
 
 # --- Pick the interpreter (prefer the repo venv) -------------------------------
 $venvPy = Join-Path $repoRoot "venv\Scripts\python.exe"
@@ -42,6 +43,7 @@ if (Test-Path $venvPy) { $python = $venvPy } else { $python = "python" }
 Write-Host "=============================================================="
 Write-Host " Experiment : $Experiment"
 Write-Host " Repo       : $repoRoot"
+Write-Host " Output dir : $repoRoot\runs\<desc>\   (desc=... override; defaults to the experiment name)"
 Write-Host " Python     : $python"
 Write-Host " Extra args : $($HydraArgs -join ' ')"
 if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {

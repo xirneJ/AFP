@@ -22,12 +22,24 @@ user: xyds25
 # Root of the AlphaFlow project (datasets/ snapshots/ output/ live under it).
 project_path: ${oc.env:ALPHAFLOW_PROJECT_PATH}
 
+# ---------------------------------------------------------------------------
+# ALL experiment artifacts go under this single folder (created automatically):
+#   <experiments_root>/<run_name>/            training run: log.txt, snapshot-*.pt,
+#                                             in-training metric-*.jsonl, sample images
+#   <experiments_root>/<run_name>/generate/   50k generated images for FID
+#   <experiments_root>/<run_name>/metrics/    final evaluation results (json/jsonl)
+#   <experiments_root>/_dataset_stats/        cached real-data feature stats (shared)
+#   <experiments_root>/_released/             generation outputs of released checkpoints
+# Change this one line if you want the folder somewhere else (e.g. another disk).
+# ---------------------------------------------------------------------------
+experiments_root: ${env.project_path}/runs
+
 # Where datasets live.  ImageNet-1K is expected at:
 #   ${env.folder_datasets_path}/imagenet/{train,val}
 folder_datasets_path: ${env.project_path}/data
 cache_dir: ${env.project_path}/.cache
-dataset_stats_dir: ${env.project_path}/data/stats
-latents_stats_dir: ${env.project_path}/data/latents-stats
+dataset_stats_dir: ${env.experiments_root}/_dataset_stats
+latents_stats_dir: ${env.experiments_root}/_latents_stats
 
 # A path to the installed Python environment directory.
 # With a plain venv this is `${project_path}/venv` (Linux) or

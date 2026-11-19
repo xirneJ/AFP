@@ -89,10 +89,10 @@ def launch(cfg: DictConfig):
 
     if cfg.direct_launch:
         # In direct-launch mode there is no `experiments/<id>-...` directory.
-        # Give every experiment its own output directory so that different runs
-        # do not accidentally try to resume from each other's checkpoints:
-        #   <project_path>/output/<desc>/
-        cfg.experiment_dir = os.path.join(cfg.env.project_path, 'output', str(cfg.desc))
+        # Every run gets its own folder under the configured experiments root so
+        # that different runs do not accidentally resume from each other:
+        #   <env.experiments_root>/<desc>/
+        cfg.experiment_dir = os.path.join(str(cfg.env.experiments_root), str(cfg.desc))
         os.makedirs(cfg.experiment_dir, exist_ok=True)
         cfg.output_dir = cfg.experiment_dir
 

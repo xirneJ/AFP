@@ -261,12 +261,16 @@ def check_layout(data_root: str):
     else:
         add(INFO, "dummy dataset", "not found (only needed for the offline smoke test)")
 
-    stats_dir = os.path.join(data_root, "stats")
+    stats_dir = os.path.join(REPO_ROOT, "runs", "_dataset_stats")
     add(INFO if os.path.isdir(stats_dir) else WARN, "dataset stats (FID)", stats_dir)
 
-    for name in ("experiments", "output"):
-        p = os.path.join(REPO_ROOT, name)
-        add(INFO, name, "present" if os.path.isdir(p) else "absent (will be created)")
+    runs_dir = os.path.join(REPO_ROOT, "runs")
+    if os.path.isdir(runs_dir):
+        runs = sorted(d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)))
+        runs = [r for r in runs if not r.startswith("_")]
+        add(OK, "runs/ (experiments root)", f"{len(runs)} run(s): {', '.join(runs[:8])}{' ...' if len(runs) > 8 else ''}" if runs else "present, no runs yet")
+    else:
+        add(INFO, "runs/ (experiments root)", "absent (will be created on first run)")
 
     # HuggingFace cache: latent-space checkpoints instantiate the sd-vae through diffusers.
     hf_home = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
