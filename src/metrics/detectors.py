@@ -11,7 +11,7 @@ import einops
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, LearnedPerceptualImagePatchSimilarity
 try:
     import torchaudio
-except ImportError:
+except Exception:  # noqa: BLE001 - optional; may be missing OR built for a different CUDA than torch
     torchaudio = None
 
 from src.utils import misc, distributed as dist, os_utils
