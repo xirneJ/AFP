@@ -18,6 +18,13 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 os.environ.setdefault('ALPHAFLOW_PROJECT_PATH', _REPO_ROOT)
+# Use the same caches as scripts/train_single_gpu.sh (the SD-VAE is cached inside the repo,
+# not in the user's ~/.cache/huggingface that check_setup looks at).
+os.environ.setdefault('HF_HOME', os.path.join(_REPO_ROOT, '.cache', 'huggingface'))
+os.environ.setdefault('TORCH_HOME', os.path.join(_REPO_ROOT, '.cache', 'torch'))
+os.environ.setdefault('XDG_CACHE_HOME', os.path.join(_REPO_ROOT, '.cache'))
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
 
 import torch
 from hydra import compose, initialize
