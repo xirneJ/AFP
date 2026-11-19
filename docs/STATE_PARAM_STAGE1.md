@@ -234,6 +234,7 @@ net_v 的 velocity 头取负），执行 A–D 四组检查（fp32、确定性�
 
 | 检查 | 容限 |
 | --- | --- |
+| **A 组**：corrected targets == 逐样本独立参考 | < 1e-3（batch-size 1 vs 全 batch 的 cuBLAS/SDPA 数值差异；production loss vs reference 仍要求 < 1e-3，实测 ~1e-7） |
 | 预测转换 `f == z-(t-r)u`（含极小间隔） | max rel diff < 1e-5 |
 | **C0 全网络映射**：backbone 输入 / FinalLayer 特征逐位相同（`torch.equal`），`raw_s == -raw_v`、`f == z+(t-r)raw_s`、`f == z-(t-r)u` | 前两项必须精确相等；其余 max rel diff < 1e-5 |
 | **C0 反证**：只扰动 state 头后等式失效 | 必须 > 1e-3（证明"仅初始化等价"） |
