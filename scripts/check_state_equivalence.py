@@ -803,7 +803,7 @@ def section_c_gradients(net_v, net_s, cfg, device):
     loss_s2 = build_loss(cfg, device, 'state')
     out_tiny = production_forward(loss_s2, net_s, tiny, cond)
     report('tiny interval (t-r=1e-3): state loss finite', bool(torch.isfinite(out_tiny['total']).all()),
-           f'max |loss| = {float(out_tiny["total"].abs().max()):.3e}')
+           f'max |loss| = {float(out_tiny["total"].detach().abs().max()):.3e}')
 
 
 # ---------------------------------------------------------------------------
