@@ -107,5 +107,7 @@ exec python scripts/generate.py \
   sampling.num_steps="${NFE}" \
   sampling.enable_trajectory_sampling=true \
   sampling.enable_consistency_sampling=false \
+  hydra.run.dir="${EXPERIMENTS_ROOT}/_hydra/generate" \
+  hydra.output_subdir=null \
   ${EXTRA[@]+"${EXTRA[@]}"} \
   "$@"

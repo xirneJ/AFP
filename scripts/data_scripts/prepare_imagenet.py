@@ -71,6 +71,12 @@ def count_images(directory: str) -> int:
     return sum(1 for f in os.listdir(directory) if f.lower().endswith(IMAGE_EXTS))
 
 
+def count_meta(directory: str) -> int:
+    if not os.path.isdir(directory):
+        return 0
+    return sum(1 for f in os.listdir(directory) if f.endswith(".meta.json"))
+
+
 def has_class_dirs(directory: str) -> bool:
     if not os.path.isdir(directory):
         return False
@@ -258,7 +264,10 @@ def main():
     val_dir = os.path.join(target, "val")
 
     def split_is_flat(d: str) -> bool:
-        return count_images(d) > 0 and not has_class_dirs(d)
+        # "Prepared" means: flat images AND one .meta.json per image.
+        # (A flat folder of raw images without meta files still needs reorganisation.)
+        n_img = count_images(d)
+        return n_img > 0 and not has_class_dirs(d) and count_meta(d) >= n_img
 
     # --- 0. already prepared? --------------------------------------------------
     if all(split_is_flat(os.path.join(target, s)) for s in splits):

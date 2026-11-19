@@ -80,5 +80,7 @@ exec python scripts/evaluate.py \
   "gen_dataset.resolution=[1,${RES},${RES}]" \
   "gen_dataset.label_shape=[]" \
   "metrics=[${METRICS}]" \
+  "hydra.run.dir=${REPO_ROOT}/runs/_hydra/eval" \
+  hydra.output_subdir=null \
   ${EXTRA[@]+"${EXTRA[@]}"} \
   "$@"
