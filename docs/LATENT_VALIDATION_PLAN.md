@@ -117,7 +117,7 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   model.ema_rampup_ratio=null \
   training.max_steps=50 training.steps_per_tick=5 \
   training.freqs.metrics=null training.freqs.metrics_rare=null \
-  training.freqs.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
+  training.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null training.freqs.save_samples=null \
   loss.alpha.scheduler=sigmoid loss.alpha.initial_value=1.0 loss.alpha.end_value=0 \
   loss.alpha.change_init_steps=0 loss.alpha.change_end_steps=1200 \
@@ -133,7 +133,7 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   model.ema_rampup_ratio=null \
   training.max_steps=50 training.steps_per_tick=5 \
   training.freqs.metrics=null training.freqs.metrics_rare=null \
-  training.freqs.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
+  training.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null training.freqs.save_samples=null \
   loss.alpha.scheduler=sigmoid loss.alpha.initial_value=1.0 loss.alpha.end_value=0 \
   loss.alpha.change_init_steps=0 loss.alpha.change_end_steps=1200 \
@@ -177,7 +177,7 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   model.ema_rampup_ratio=null \
   training.max_steps=1000 training.steps_per_tick=10 \
   training.freqs.metrics=null training.freqs.metrics_rare=null \
-  training.freqs.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
+  training.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null \
   training.freqs.save_samples=1000 \
   loss.alpha.scheduler=sigmoid loss.alpha.initial_value=1.0 loss.alpha.end_value=0 \
@@ -193,7 +193,7 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
   model.ema_rampup_ratio=null \
   training.max_steps=1000 training.steps_per_tick=10 \
   training.freqs.metrics=null training.freqs.metrics_rare=null \
-  training.freqs.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
+  training.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
   training.freqs.snapshot=null training.freqs.snapshot_latest=null \
   training.freqs.save_samples=1000 \
   loss.alpha.scheduler=sigmoid loss.alpha.initial_value=1.0 loss.alpha.end_value=0 \
