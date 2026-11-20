@@ -142,7 +142,7 @@ COMMON_OVERRIDES() {
     "training.steps_per_tick=$tick"
     "training.freqs.metrics=null"
     "training.freqs.metrics_rare=null"
-    "training.freqs.metrics_final=[]"
+    "training.metrics_final=[]"
     "training.freqs.loss_val=null"
     "training.freqs.loss_per_sigma=null"
     "training.freqs.snapshot=null"
