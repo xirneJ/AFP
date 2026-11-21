@@ -54,10 +54,13 @@ while [[ $# -gt 0 ]]; do
     --stages) STAGES="$2"; shift 2 ;;
     --run-name-prefix) PREFIX="$2"; shift 2 ;;
     --init) INIT="$2"; shift 2 ;;
+    --no-lock) NO_LOCK=1; shift ;;
     -h|--help) sed -n '1,40p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1"; exit 2 ;;
   esac
 done
+
+NO_LOCK="${NO_LOCK:-0}"
 
 mkdir -p runs
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -67,10 +70,15 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 log() { echo "[$(date '+%F %T')] $*"; }
 
 LOCK_FILE=/tmp/alphaflow_stage3_3k.lock
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  log "Another run_stage3_3k.sh instance is already running. Exiting."
-  exit 1
+if (( NO_LOCK == 0 )); then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "Another run_stage3_3k.sh instance is already running. Exiting."
+    log "(If you are sure there is none, rerun with --no-lock.)"
+    exit 1
+  fi
+else
+  log "WARNING: --no-lock given; skipping the duplicate-instance lock."
 fi
 
 gpu_free_mib() { nvidia-smi -i 0 --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || true; }
