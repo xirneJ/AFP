@@ -132,8 +132,9 @@ def main():
     for name, module in modules.items():
         if module is not None:
             num_heads += check_negation(name, module)
-    report('every module pair has exactly one dual head', num_heads == 2 * sum(m is not None for m in modules.values()),
-           f'checked {num_heads} heads')
+    num_modules = sum(module is not None for module in modules.values())
+    report('every loaded module has exactly one dual head', num_heads == num_modules,
+           f'checked {num_heads} heads across {num_modules} modules')
 
     # Full-network equivalence on the released weights: f_state == z_t - (t-r) * u_velocity.
     net = misc.unwrap_module(nets.net).eval()
