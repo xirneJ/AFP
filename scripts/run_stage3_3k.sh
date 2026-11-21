@@ -69,14 +69,34 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
-LOCK_FILE=/tmp/alphaflow_stage3_3k.lock
-if (( NO_LOCK == 0 )); then
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    log "Another run_stage3_3k.sh instance is already running. Exiting."
-    log "(If you are sure there is none, rerun with --no-lock.)"
-    exit 1
+# Directory-based lock: unlike flock on an inherited fd, a child process (e.g. `sleep`) cannot keep
+# the lock alive after the main script is killed. Stale locks are detected via the PID file.
+LOCK_DIR=/tmp/alphaflow_stage3_3k.lockdir
+acquire_lock() {
+  local pidfile="${LOCK_DIR}/pid" other
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$pidfile"
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    return 0
   fi
+  other="$(cat "$pidfile" 2>/dev/null || true)"
+  if [[ -n "$other" ]] && kill -0 "$other" 2>/dev/null; then
+    log "Another run_stage3_3k.sh instance (pid ${other}) is already running. Exiting."
+    log "(If you are sure there is none, rerun with --no-lock.)"
+    return 1
+  fi
+  log "Removing stale lock directory (pid ${other:-unknown} is not alive)."
+  rm -rf "$LOCK_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$pidfile"
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    return 0
+  fi
+  log "Failed to acquire the lock directory."; return 1
+}
+
+if (( NO_LOCK == 0 )); then
+  acquire_lock || exit 1
 else
   log "WARNING: --no-lock given; skipping the duplicate-instance lock."
 fi
