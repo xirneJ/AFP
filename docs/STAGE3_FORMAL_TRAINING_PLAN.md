@@ -204,11 +204,18 @@ done
 > 注意：50 步 prof 的 `num_warmup_steps=10`、`change_end_steps=50` 只是为了保持分支覆盖，
 > **吞吐/显存与 schedule 无关**；正式 3k 仍用 §5 的 75/3000。
 
-### 4.5 判定
+### 4.5 判定（以 samples/sec 为主）
 
-- 若 b32 稳定且 `reserved < 28 GiB`，正式 3k/20k 统一用 `batch_gpu=32`（global batch 仍 256，累积 8 轮）；
-- 若 b32 不稳定或收益 <10%，正式统一用 `batch_gpu=16`；
-- 两者都必须在 A0/A1/A2 三组中保持一致。
+由于全局 batch 固定为 256（`num_accum_rounds = 256/batch_gpu`），
+`samples/sec = 256 × iter/sec`，因此比较 b16/b32 时应以 **`samples/sec`** 为准（等价于
+optimizer 步吞吐，但比 `iter/sec` 更直观地反映"每张卡每秒处理多少样本"）。
+
+b32 通过条件（全部满足才统一使用 b32，否则统一 b16）：
+
+1. **A2 b32 峰值 `reserved` < 28 GiB**（给系统/碎片留余量）；
+2. 无 OOM、无 NaN/Inf；
+3. **`samples/sec` 相对 b16 提升 ≥ 10%**；
+4. 连续运行稳定（loss/grad 正常，无显存增长趋势）。
 
 ---
 
@@ -309,6 +316,102 @@ bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
 
 - 三组均 3000/3000 步、无 NaN/Inf、无 OOM、`grad_norm` 稳定（<16，不触发裁剪）；
 - A0/A1 loss 曲线接近（非逐点重合）；A2 loss 同量级、teacher 字段正常
-  （`teacher_ema_updates≈3000`、`teacher_ema_beta=0.9999`、`teacher_student_rel_dist` 单调缓增）；
+  （`teacher_ema_updates_total≈3000`、`teacher_ema_beta=0.9999`、`teacher_student_rel_dist` 单调缓增）；
 - 各自 `snapshot-00003000.pt`（A2 `teacher=True`）可加载、可生成；
 - 任何不满足 → 先修配置/环境，不进 20k。
+
+---
+
+## 6. A1 初始化转换审计（3k 前置，必须通过）
+
+问题：从 released **velocity** checkpoint 加载 state 模型时，是否真的把**完整输出头**
+（weight 和 bias）取负？`allow_missing_keys=true` 到底忽略了哪些 key？
+
+代码事实（`src/training/network_utils.py`）：
+
+- `init_networks` 在**加载之前**先用 `init_state_head_from_velocity_` 把 state 头初始化为
+  `linear_state.load_state_dict(linear.state_dict())` 再 `neg_()` weight/bias（line 105–127）；
+- `load_module_state` 在**加载之后**检查 missing keys：若含 `linear_state`，对**已加载的 velocity 头**
+  再执行一次同样的取负（line 359–368）——因此 released ckpt 的 velocity 权重会正确映射到 state 头；
+- `allow_missing_keys=true` 允许的 missing keys 应当**恰好是**每个模块的
+  `model.final_layer.linear_state.weight` 与 `.bias` 两个 key；unexpected keys 应为 0；
+  其他任何被忽略的参数都属于审计失败（脚本会 assert）。
+
+### 审计命令（只读，不训练；需要 snapshots/`alphaflow-B-2-finetune-init.pt`）
+
+```bash
+cd ~/qiangchen/AFP
+HF_HUB_OFFLINE=1 python scripts/check_released_state_init.py
+```
+
+脚本 `scripts/check_released_state_init.py` 会：
+
+1. 用与 A1 相同的方式构建 state 模型（`model.parameterization=state`）；
+2. 打印 `[net]/[ema]` 的 **exact missing / unexpected key 列表**；
+3. 走生产加载路径（`load_module_state`）后逐元素检查
+   `W_state == -W_velocity`、`b_state == -b_velocity`（bitwise）；
+4. 用 released 权重做全网络等价检查：`f_state(z_t,r,t) == z_t-(t-r)·u_velocity`（≤1e-5）；
+5. 打印 `RESULT: ALL ... CHECKS PASSED`。
+
+期望输出要点：
+
+```text
+[net] missing keys (2): ['model.final_layer.linear_state.weight', 'model.final_layer.linear_state.bias']
+[net] unexpected keys (0): []
+[ema] missing keys (2): [...linear_state.weight, ...linear_state.bias]
+[ema] unexpected keys (0): []
+Re-initialized 1 state head(s) from the loaded velocity head (the checkpoint has no state head).
+...
+RESULT: ALL ... CHECKS PASSED — released velocity ckpt -> state head is exact.
+```
+
+---
+
+## 7. A2 resume 连续性测试（3k 前置，批准执行）
+
+目标：验证"连续训练 1050 步"与"1000 步保存 → 恢复 → 再训 50 步"在 **EMA/optimizer 状态**上连续。
+只验证恢复机制，不作为训练质量结论（旧 1k 实验的 LR schedule 本身有问题）。
+
+要求：**`whole_state=true`**（恢复 net/ema/optimizer/grad_scaler/lr_scheduler/stats/teacher），
+复用现有 `runs/stage2-a2-latent-1k/snapshot-00001000.pt`。
+
+```bash
+cd ~/qiangchen/AFP
+export HF_HUB_OFFLINE=1
+nohup bash scripts/train_single_gpu.sh alphaflow-sigmoid-latentspace-B-2-single-gpu \
+  desc=stage2-a2-latent-1k \
+  model.parameterization=state loss.target_branch=ema \
+  training.resume.whole_state=true \
+  training.resume.allow_missing_keys=true \
+  model.ema_rampup_ratio=null \
+  training.max_steps=1050 training.steps_per_tick=5 \
+  training.freqs.metrics=null training.freqs.metrics_rare=null \
+  training.metrics_final=[] training.freqs.loss_val=null training.freqs.loss_per_sigma=null \
+  training.freqs.snapshot=null training.freqs.snapshot_latest=null training.freqs.save_samples=null \
+  dataset.batch_gpu=16 \
+  loss.alpha.scheduler=sigmoid loss.alpha.initial_value=1.0 loss.alpha.end_value=0 \
+  loss.alpha.change_init_steps=0 loss.alpha.change_end_steps=1200 \
+  loss.alpha.clamp_value=0.005 loss.alpha.gamma=25.0 \
+  > runs/_a2_resume_1050.out 2>&1 &
+tail -f runs/_a2_resume_1050.out
+```
+
+（不传 `on_start_ckpt_path`；训练器会在输出目录发现 `snapshot-00001000.pt` 并自动恢复。）
+
+期望日志/指标（对照用户验收表）：
+
+| 检查项 | 期望 |
+|---|---|
+| 恢复日志 | `Found 1 snapshots ... resume ... snapshot-00001000.pt`；`Loaded the EMA target teacher state from the snapshot.` |
+| `cur_step` | 首 tick 从 ~1005 开始，结束 1050 |
+| `teacher_ema_updates`（本进程） | 1 → 50（每次 optimizer step 一次） |
+| `teacher_ema_updates_total` | **1000 → 1050**（新日志字段，续上历史计数） |
+| teacher 参数 | 每个 resumed step 都在变化（相邻 tick 的 teacher 不同） |
+| `teacher_ema_beta` | 0.9999，与恢复前一致 |
+| `eval_ema_beta` | 0.9999，与 teacher beta 一致 |
+| teacher 梯度 | 始终不存在（由 F 组与实现保证） |
+| optimizer/scheduler | 能成功 resume 即证明已恢复（`allow_missing_optim=false`，缺 key 会直接报错） |
+| `teacher_student_rel_dist` | 从 ~0.00231 起平滑变化，**无跳变**（不应回到 ~0 或突变） |
+| NaN/Inf | 0 |
+
+通过后再进行 3k。

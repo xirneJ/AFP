@@ -73,6 +73,12 @@ def train(cfg: DictConfig):
     eval_ema_beta_last = 0.0
     teacher_ema_beta_last = 0.0
     teacher_ema_updates = 0
+    # `teacher_ema_updates` counts updates performed by THIS process (resets on resume);
+    # `teacher_ema_updates_total` continues the count from the resumed optimizer step.
+    teacher_ema_updates_total = 0
+    if getattr(loss_fn, 'teacher', None) is not None:
+        _ema_freq = max(int(cfg.model.ema_update_freq), 1)
+        teacher_ema_updates_total = 0 if stats.cur_step == 0 else (stats.cur_step - 1) // _ema_freq + 1
 
     # Note: we need to print the model info before computing the stats since it inits FSDP.
     logging_utils.print_model_info(cfg, data.batch_info.batch_gpu, nets, device)
@@ -217,6 +223,7 @@ def train(cfg: DictConfig):
                 cfg, nets.net, loss_fn.teacher, stats, teacher_named_parameters, teacher_ema_named_parameters)
             teacher_ema_beta_last = float(teacher_beta)
             teacher_ema_updates += 1
+            teacher_ema_updates_total += 1
 
         with torch.profiler.record_function('stats_log_and_update'):
             # Let's save some stats
@@ -263,6 +270,7 @@ def train(cfg: DictConfig):
                 extra_stats['teacher_student_rel_dist'] = network_utils.teacher_student_distance_(loss_fn.teacher, nets.net)
                 extra_stats['teacher_ema_beta'] = teacher_ema_beta_last
                 extra_stats['teacher_ema_updates'] = teacher_ema_updates
+                extra_stats['teacher_ema_updates_total'] = teacher_ema_updates_total
             if cfg.model.use_ema:
                 extra_stats['eval_ema_beta'] = eval_ema_beta_last
             grad_clip_cfg = cfg.model.get('grad_clip') if hasattr(cfg.model, 'get') else None
