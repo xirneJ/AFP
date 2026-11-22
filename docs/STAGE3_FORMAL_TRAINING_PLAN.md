@@ -204,6 +204,16 @@ done
 > 注意：50 步 prof 的 `num_warmup_steps=10`、`change_end_steps=50` 只是为了保持分支覆盖，
 > **吞吐/显存与 schedule 无关**；正式 3k 仍用 §5 的 75/3000。
 
+### 4.4.1 最终决策（2026-11-22）：跳过 profiling，统一 `batch_gpu=16`
+
+- 依据：`batch_gpu=16` 已在真实 ImageNet latent 上完成 A0/A1/A2 各 3000 步，稳定显存
+  A0/A1 ~7.5GB、A2 ~8.45GB reserved（峰值 11.13GB），无 OOM、无 NaN；
+- 20k 的首要目标是 **A0/A1/A2 的可比、可复现、可信对照**，而不是吞吐最优；
+  global batch=256、优化器、lr、数据策略、α schedule 在 b16 下保持一致即可满足要求；
+- 因此 **20k 不采用 b32**（避免引入未验证的 batch 变量与额外 profiling 等待）；
+  若将来 20k 墙钟时间不可接受，再单独做吞吐优化（不影响本组实验结论）；
+- 该决策不影响 §4 的判定规则本身，仅表示本阶段不执行 profiling。
+
 ### 4.5 判定（以 samples/sec 为主）
 
 由于全局 batch 固定为 256（`num_accum_rounds = 256/batch_gpu`），
