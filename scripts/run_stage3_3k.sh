@@ -1,30 +1,45 @@
 #!/usr/bin/env bash
-# Stage 3: runs the three 3k-step experiments sequentially on an idle GPU.
+# Runs the three A0/A1/A2 experiments sequentially on a single GPU (default 3k steps; reusable for
+# the 20k stage via --steps 20000 --warmup 500 --run-name-prefix stage4).
 #
 #   A0: velocity + shared target  (no teacher)
 #   A1: state    + shared target  (no teacher)
 #   A2: state    + EMA teacher    (loss.target_branch=ema)
 #
-# All three use the SAME released init snapshot, the SAME 3k proportional alpha schedule
-# (change_end_steps=3000), the SAME 75-step LR warmup, the SAME batch size and the SAME
+# All three use the SAME released init snapshot, the SAME proportional alpha schedule
+# (change_end_steps=<steps>), the SAME LR warmup, the SAME batch size and the SAME
 # logging/checkpoint settings. The ONLY intended variables are the parameterization and
 # the target branch.
 #
+# Resume support: if runs/<desc>/snapshot-*.pt already exists, that arm resumes from the latest
+# snapshot with whole_state=true (optimizer/scheduler/EMA/teacher restored); otherwise it starts
+# fresh from --init with whole_state=false. For long 20k runs use --snapshot-latest 1000 so an
+# interrupted arm can be resumed by simply rerunning the same command.
+#
 # Usage:
 #   nohup bash scripts/run_stage3_3k.sh --batch-gpu 16 > runs/_stage3_3k.log 2>&1 &
-#   tail -f runs/_stage3_3k.log
+#   # 20k:
+#   nohup bash scripts/run_stage3_3k.sh --steps 20000 --warmup 500 --save-samples 5000 \
+#     --snapshot-latest 1000 --run-name-prefix stage4 --batch-gpu 16 \
+#     > runs/_stage4_20k.log 2>&1 &
 #
 # Options:
 #   --batch-gpu 16        dataset.batch_gpu (must match the profiling decision; default 16)
+#   --steps 3000          total optimizer steps per arm
+#   --warmup 75           LR warmup steps (official ratio: 2.5% of budget)
+#   --save-samples 1000   freqs.save_samples (fakes at multiples; null disables)
+#   --snapshot-latest null  freqs.snapshot_latest (e.g. 1000 for resumable long runs)
+#   --desc-suffix 3k      run-dir suffix (default: <steps/1000>k)
 #   --min-free-mib 24000  required free VRAM before starting (idle GPU)
-#   --max-util 20         max GPU utilization (%) to consider the card idle
+#   --max-util 20         max GPU utilization (%) to consider the card idle (100 disables)
 #   --sustain-checks 3    consecutive ready polls required
 #   --poll-sec 60         polling interval
 #   --stages a0,a1,a2     subset/order of arms to run (default: a0,a1,a2)
-#   --run-name-prefix stage3   desc prefix (desc=<prefix>-a0-latent-3k, ...)
+#   --run-name-prefix stage3   desc prefix (desc=<prefix>-a0-latent-<suffix>, ...)
 #   --init PATH           init snapshot (default snapshots/alphaflow-B-2-finetune-init.pt)
+#   --no-lock             skip the duplicate-instance lock (only if you are sure)
 #
-# After the three runs the script writes runs/_stage3_3k_report.txt and prints it.
+# After the runs the script writes runs/_<prefix>_report.txt and prints it.
 
 set -uo pipefail
 
@@ -43,6 +58,9 @@ PRESET="alphaflow-sigmoid-latentspace-B-2-single-gpu"
 STEPS=3000
 TICK=10
 WARMUP=75
+SAVE_SAMPLES=1000
+SNAPSHOT_LATEST=null
+DESC_SUFFIX=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +72,11 @@ while [[ $# -gt 0 ]]; do
     --stages) STAGES="$2"; shift 2 ;;
     --run-name-prefix) PREFIX="$2"; shift 2 ;;
     --init) INIT="$2"; shift 2 ;;
+    --steps) STEPS="$2"; shift 2 ;;
+    --warmup) WARMUP="$2"; shift 2 ;;
+    --save-samples) SAVE_SAMPLES="$2"; shift 2 ;;
+    --snapshot-latest) SNAPSHOT_LATEST="$2"; shift 2 ;;
+    --desc-suffix) DESC_SUFFIX="$2"; shift 2 ;;
     --no-lock) NO_LOCK=1; shift ;;
     -h|--help) sed -n '1,40p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1"; exit 2 ;;
@@ -61,6 +84,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 NO_LOCK="${NO_LOCK:-0}"
+DESC_SUFFIX="${DESC_SUFFIX:-$((STEPS / 1000))k}"
 
 mkdir -p runs
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -143,8 +167,6 @@ if [[ ! -f "$INIT" ]]; then
 fi
 
 COMMON=(
-  "training.resume.on_start_ckpt_path=$INIT"
-  "training.resume.whole_state=false"
   "model.ema_rampup_ratio=null"
   "model.lr_scheduler.num_warmup_steps=$WARMUP"
   "training.max_steps=$STEPS"
@@ -155,8 +177,8 @@ COMMON=(
   "training.freqs.loss_val=null"
   "training.freqs.loss_per_sigma=null"
   "training.freqs.snapshot=null"
-  "training.freqs.snapshot_latest=null"
-  "training.freqs.save_samples=1000"
+  "training.freqs.snapshot_latest=$SNAPSHOT_LATEST"
+  "training.freqs.save_samples=$SAVE_SAMPLES"
   "dataset.batch_gpu=$BATCH_GPU"
   "loss.alpha.scheduler=sigmoid"
   "loss.alpha.initial_value=1.0"
@@ -169,8 +191,16 @@ COMMON=(
 
 run_arm() {
   local desc="$1"; shift
-  log "Launching ${desc} (batch_gpu=${BATCH_GPU})..."
-  if ! bash scripts/train_single_gpu.sh "$PRESET" "desc=$desc" "${COMMON[@]}" "$@"; then
+  local run_dir="runs/$desc"
+  local resume_args=()
+  if compgen -G "$run_dir/snapshot-*.pt" > /dev/null; then
+    log "Found existing snapshots in $run_dir -> resuming from the latest one (whole_state=true)."
+    resume_args=("training.resume.on_start_ckpt_path=null" "training.resume.whole_state=true")
+  else
+    resume_args=("training.resume.on_start_ckpt_path=$INIT" "training.resume.whole_state=false")
+  fi
+  log "Launching ${desc} (batch_gpu=${BATCH_GPU}, steps=${STEPS})..."
+  if ! bash scripts/train_single_gpu.sh "$PRESET" "desc=$desc" "${resume_args[@]}" "${COMMON[@]}" "$@"; then
     log "ERROR: ${desc} failed. Stopping (the remaining arms will NOT run)."
     exit 1
   fi
@@ -182,15 +212,15 @@ for arm in "${ARM_LIST[@]}"; do
   case "$arm" in
     a0)
       wait_for_gpu "a0"
-      run_arm "${PREFIX}-a0-latent-3k"
+      run_arm "${PREFIX}-a0-latent-${DESC_SUFFIX}"
       ;;
     a1)
       wait_for_gpu "a1"
-      run_arm "${PREFIX}-a1-latent-3k" "model.parameterization=state" "training.resume.allow_missing_keys=true"
+      run_arm "${PREFIX}-a1-latent-${DESC_SUFFIX}" "model.parameterization=state" "training.resume.allow_missing_keys=true"
       ;;
     a2)
       wait_for_gpu "a2"
-      run_arm "${PREFIX}-a2-latent-3k" "model.parameterization=state" "loss.target_branch=ema" "training.resume.allow_missing_keys=true"
+      run_arm "${PREFIX}-a2-latent-${DESC_SUFFIX}" "model.parameterization=state" "loss.target_branch=ema" "training.resume.allow_missing_keys=true"
       ;;
     *)
       log "ERROR: unknown arm '$arm' (supported: a0,a1,a2)"; exit 2 ;;
@@ -199,16 +229,18 @@ done
 
 # --- report --------------------------------------------------------------
 log "All requested arms finished. Building report..."
-REPORT=runs/_stage3_3k_report.txt
-python - "$REPORT" "$PREFIX" "$BATCH_GPU" <<'PY'
+REPORT="runs/_${PREFIX}_report.txt"
+python - "$REPORT" "$PREFIX" "$BATCH_GPU" "$STEPS" "$DESC_SUFFIX" <<'PY'
 import glob
 import os
 import re
 import sys
 
-report_path, prefix, batch_gpu = sys.argv[1], sys.argv[2], sys.argv[3]
+report_path, prefix, batch_gpu, expected_steps, suffix = (
+    sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
 arms = ['a0', 'a1', 'a2']
-lines = [f'=== Stage 3 3k report (batch_gpu={batch_gpu}) ===', '']
+run_dir_of = lambda arm: f'runs/{prefix}-{arm}-latent-{suffix}'
+lines = [f'=== Stage 3 report: {prefix} (steps={expected_steps}, batch_gpu={batch_gpu}) ===', '']
 ok = True
 
 def read_ticks(path):
@@ -238,7 +270,7 @@ def last(ticks, key):
     return 'NA'
 
 for arm in arms:
-    run_dir = f'runs/{prefix}-{arm}-latent-3k'
+    run_dir = run_dir_of(arm)
     log_txt = f'{run_dir}/log.txt'
     lines.append(f'--- {arm}: {run_dir} ---')
     if not os.path.isfile(log_txt):
@@ -258,16 +290,16 @@ for arm in arms:
     lines.append(f'  loss_total first={losses[0]:.6f} last={losses[-1]:.6f} min={min(losses):.6f} max={max(losses):.6f}')
     lines.append(f'  grad_norm first={grads[0]:.4f} last={grads[-1]:.4f} max={max(grads):.4f}')
     lines.append(f'  NaNs={nans} Infs={infs}')
-    if int(max(steps)) < 3000:
-        lines.append('  FAIL: did not reach 3000 steps'); ok = False
+    if int(max(steps)) < expected_steps:
+        lines.append(f'  FAIL: did not reach {expected_steps} steps'); ok = False
     if nans or infs:
         lines.append('  FAIL: NaN/Inf in gradients'); ok = False
     if arm == 'a2':
         lines.append(f'  teacher_ema_beta last={last(ticks, "teacher_ema_beta")}  '
                      f'teacher_ema_updates_total last={last(ticks, "teacher_ema_updates_total")}  '
                      f'teacher_student_rel_dist last={last(ticks, "teacher_student_rel_dist")}')
-        if last(ticks, 'teacher_ema_updates_total') not in ('NA', '3000'):
-            lines.append('  WARN: teacher updates total != 3000')
+        if last(ticks, 'teacher_ema_updates_total') not in ('NA', str(expected_steps)):
+            lines.append(f'  WARN: teacher updates total != {expected_steps}')
     snap = sorted(glob.glob(f'{run_dir}/snapshot-*.pt'))
     if snap:
         lines.append(f'  snapshot: {snap[-1]} ({os.path.getsize(snap[-1]) / 1e9:.2f} GB)')
@@ -276,8 +308,10 @@ for arm in arms:
     lines.append('')
 
 # A0 vs A1 loss closeness (soft)
-ticks_a0 = read_ticks(f'runs/{prefix}-a0-latent-3k/log.txt') if os.path.isfile(f'runs/{prefix}-a0-latent-3k/log.txt') else []
-ticks_a1 = read_ticks(f'runs/{prefix}-a1-latent-3k/log.txt') if os.path.isfile(f'runs/{prefix}-a1-latent-3k/log.txt') else []
+dir_a0 = f'{run_dir_of("a0")}/log.txt'
+dir_a1 = f'{run_dir_of("a1")}/log.txt'
+ticks_a0 = read_ticks(dir_a0) if os.path.isfile(dir_a0) else []
+ticks_a1 = read_ticks(dir_a1) if os.path.isfile(dir_a1) else []
 if ticks_a0 and ticks_a1:
     pairs = [(float(a['loss_total']), float(b['loss_total'])) for a, b in zip(ticks_a0, ticks_a1)
              if a.get('loss_total') and b.get('loss_total')]
@@ -285,7 +319,7 @@ if ticks_a0 and ticks_a1:
         rel = sorted(abs(a - b) / max(abs(a), 1e-12) for a, b in pairs)
         lines.append(f'A0 vs A1 loss_total rel diff: median={rel[len(rel)//2]:.3e} max={rel[-1]:.3e}')
 lines.append('')
-lines.append('RESULT: ' + ('3k runs PASS' if ok else '3k runs have FAILURES, see above'))
+lines.append('RESULT: ' + ('PASS' if ok else 'FAILURES, see above'))
 with open(report_path, 'w', encoding='utf-8') as f:
     f.write('\n'.join(lines) + '\n')
 print('\n'.join(lines))
