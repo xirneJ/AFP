@@ -204,15 +204,29 @@ done
 > 注意：50 步 prof 的 `num_warmup_steps=10`、`change_end_steps=50` 只是为了保持分支覆盖，
 > **吞吐/显存与 schedule 无关**；正式 3k 仍用 §5 的 75/3000。
 
-### 4.4.1 最终决策（2026-11-22）：跳过 profiling，统一 `batch_gpu=16`
+### 4.4.1 最终决策（2026-11-22，profiling 已完成）：20k 统一 `batch_gpu=32`
 
-- 依据：`batch_gpu=16` 已在真实 ImageNet latent 上完成 A0/A1/A2 各 3000 步，稳定显存
-  A0/A1 ~7.5GB、A2 ~8.45GB reserved（峰值 11.13GB），无 OOM、无 NaN；
-- 20k 的首要目标是 **A0/A1/A2 的可比、可复现、可信对照**，而不是吞吐最优；
-  global batch=256、优化器、lr、数据策略、α schedule 在 b16 下保持一致即可满足要求；
-- 因此 **20k 不采用 b32**（避免引入未验证的 batch 变量与额外 profiling 等待）；
-  若将来 20k 墙钟时间不可接受，再单独做吞吐优化（不影响本组实验结论）；
-- 该决策不影响 §4 的判定规则本身，仅表示本阶段不执行 profiling。
+实测（50 步/组，干净 RTX 5090；指标取最后 5 个 tick 中位数，即偏 JVP 重的保守口径）：
+
+| run | iter/sec | samples/sec | gpumem/reserved max | NaN/Inf | OOM |
+|---|---|---|---|---|---|
+| prof-a0-b16 | 0.270 | 70.1 | 18.55 / 18.71 GB | 0 / 0 | 否 |
+| prof-a0-b32 | 0.470 | 119.7 | 18.55 / 18.71 GB | 0 / 0 | 否 |
+| prof-a2-b16 | 0.250 | 63.1 | 19.36 / 19.53 GB | 0 / 0 | 否 |
+| prof-a2-b32 | 0.430 | 110.6 | 19.36 / 19.53 GB | 0 / 0 | 否 |
+
+判定（§4.5 规则，全部满足）：
+
+- A2 b32 `reserved max = 19.53 GiB < 28 GiB` ✅；
+- `samples/sec` 提升：a0 **+70.6%**、a2 **+75.4%**（均 ≥ 10%）✅；
+- 无 OOM / NaN / Inf、四组均跑满 50 步 ✅。
+
+结论：**20k 的 A0/A1/A2 统一使用 `batch_gpu=32`**（global batch 仍 256，梯度累积 8 轮；
+b32 显存峰值 ~19.5GB，运行时需保证 ≥ 24GB 空闲）。3k 是独立验证阶段（b16），
+20k 从 released checkpoint 重启、三组同用 b32，内部可比性不受影响。
+
+> 说明：report 里的 `gpumem/reserved max` 是逐 tick 最大值（含 step 1 初始化峰值，b16/b32 相同）；
+> b32 的稳态显存在原始 tick 中更高（A0 约 8.9/11.8GB），但远低于 28GB 门槛。
 
 ### 4.5 判定（以 samples/sec 为主）
 
