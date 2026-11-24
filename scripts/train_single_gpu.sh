@@ -33,6 +33,10 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/.cache/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/.cache}"
+# Prefer the China mirror for any HuggingFace metadata/weight downloads (hf.co can time out for
+# ~2 minutes per retry here). Everything needed for the standard runs is already cached.
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TOKENIZERS_PARALLELISM=false

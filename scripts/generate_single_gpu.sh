@@ -37,6 +37,11 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/.cache/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/.cache}"
+# China mirror + local cache by default: hf.co HEAD requests can stall ~2 minutes per retry even
+# though the SD-VAE is already cached, which used to dominate generation wall time.
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 
 CKPT="${CKPT:-snapshots/alphaflow-B-2-cfg.pt}"

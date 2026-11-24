@@ -37,6 +37,10 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/.cache/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/.cache}"
+# China mirror + local cache by default (avoids long hf.co HEAD-request timeouts; SD-VAE is cached).
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 
 GEN_DIR="${1:-}"
